@@ -1,7 +1,16 @@
-export default function RootLayout({ children }) {
+export const metadata = {
+  title: "Ghost OS",
+  description: "Ghost OS",
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body style={{ margin: 0 }}>{children}</body>
     </html>
   );
 }
