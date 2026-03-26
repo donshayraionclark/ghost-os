@@ -2,13 +2,11 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import {
-  MessageSquare,
-  Users,
-  Zap,
-  Flame,
-  SendHorizonal,
-} from "lucide-react";
+import { MessageSquare, Users, Zap, Flame, SendHorizonal } from "lucide-react";
+
+import { Canvas, useFrame } from "@react-three/fiber";
+import { Environment, Sparkles, useTexture } from "@react-three/drei";
+import * as THREE from "three";
 
 type Msg = {
   id: number;
@@ -68,149 +66,204 @@ function localSet(key: string, value: any) {
   } catch {}
 }
 
-/** Big “3D-ish” Ghost avatar: tilt, glow, breathe, blink, speaking pulse */
-function GhostAvatar({
-  src = "/Ghost2.png",
-  size = 160,
-  speaking = false,
+/**
+ * 3D Ghost:
+ * - Uses your /public/Ghost2.png as texture
+ * - "3D" box (front face = image, sides dark)
+ * - Constant idle: float + breathe + glow pulse + blink (scaleY micro-dip)
+ * - Reacts to mouse (look/tilt)
+ * - Speaking pulse
+ */
+function Ghost3D({
+  speaking,
+  mood,
   onClick,
 }: {
-  src?: string;
-  size?: number;
-  speaking?: boolean;
+  speaking: boolean;
+  mood: number; // 0..100 heat
   onClick?: () => void;
 }) {
-  const [blink, setBlink] = useState(false);
-  const cardRef = useRef<HTMLDivElement | null>(null);
-  const [rot, setRot] = useState({ x: 0, y: 0 });
+  const group = useRef<THREE.Group>(null);
+  const face = useRef<THREE.Mesh>(null);
+  const glow = useRef<THREE.Mesh>(null);
 
-  // random blink
+  const tex = useTexture("/Ghost2.png");
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 8;
+
+  const mouse = useRef({ x: 0, y: 0 });
+
   useEffect(() => {
-    const id = setInterval(() => {
-      setBlink(true);
-      setTimeout(() => setBlink(false), 140);
-    }, 3200 + Math.random() * 2500);
-    return () => clearInterval(id);
+    const onMove = (e: MouseEvent) => {
+      const x = (e.clientX / window.innerWidth) * 2 - 1; // -1..1
+      const y = (e.clientY / window.innerHeight) * 2 - 1;
+      mouse.current = { x, y };
+    };
+    window.addEventListener("mousemove", onMove);
+    return () => window.removeEventListener("mousemove", onMove);
   }, []);
 
-  const handleMove = (e: React.MouseEvent) => {
-    const el = cardRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    const px = (e.clientX - r.left) / r.width; // 0..1
-    const py = (e.clientY - r.top) / r.height; // 0..1
-    const x = (py - 0.5) * -14; // rotateX
-    const y = (px - 0.5) * 18; // rotateY
-    setRot({ x, y });
-  };
+  // blink (brief squash)
+  const blinkT = useRef(0);
+  const nextBlink = useRef(1.8 + Math.random() * 2.2);
 
-  const reset = () => setRot({ x: 0, y: 0 });
+  useFrame((state, dt) => {
+    const t = state.clock.getElapsedTime();
+    const g = group.current;
+    if (!g) return;
+
+    // Idle float/breathe
+    const float = Math.sin(t * 1.2) * 0.08;
+    const breathe = 1 + Math.sin(t * 1.6) * 0.02;
+
+    // Look/tilt toward mouse
+    const targetRotY = mouse.current.x * 0.35;
+    const targetRotX = -mouse.current.y * 0.18;
+
+    g.position.y = float;
+    g.rotation.y += (targetRotY - g.rotation.y) * 0.08;
+    g.rotation.x += (targetRotX - g.rotation.x) * 0.08;
+
+    // speaking pulse (stronger)
+    const talk = speaking ? 1 + Math.sin(t * 9) * 0.05 : 1;
+
+    // heat affects glow intensity
+    const heatBoost = 0.35 + (mood / 100) * 0.75;
+
+    g.scale.setScalar(breathe * talk);
+
+    // blink timing
+    blinkT.current += dt;
+    if (blinkT.current > nextBlink.current) {
+      // start blink
+      nextBlink.current = blinkT.current + (1.8 + Math.random() * 2.2);
+      // blink animation: quick squash
+      if (face.current) {
+        face.current.scale.y = 0.82;
+        setTimeout(() => {
+          if (face.current) face.current.scale.y = 1;
+        }, 120);
+      }
+    }
+
+    // glow pulse
+    if (glow.current) {
+      const mat = glow.current.material as THREE.MeshStandardMaterial;
+      mat.opacity = 0.20 + Math.sin(t * 2.3) * 0.05 + (speaking ? 0.10 : 0);
+      mat.emissiveIntensity = heatBoost + (speaking ? 0.6 : 0);
+    }
+  });
 
   return (
-    <motion.div
-      ref={cardRef}
-      onMouseMove={handleMove}
-      onMouseLeave={reset}
+    <group
+      ref={group}
       onClick={onClick}
-      title="Click Ghost"
-      style={{
-        width: size,
-        height: size,
-        borderRadius: 26,
-        cursor: "pointer",
-        perspective: 900,
-        display: "grid",
-        placeItems: "center",
-        userSelect: "none",
-      }}
-      animate={{ y: [0, -2, 0] }}
-      transition={{ duration: 3.2, repeat: Infinity, ease: "easeInOut" }}
+      // Position + scale makes him feel BIG in frame
+      position={[0, -0.15, 0]}
     >
-      <motion.div
+      {/* halo glow plane behind */}
+      <mesh ref={glow} position={[0, 0, -0.26]}>
+        <planeGeometry args={[2.7, 2.7]} />
+        <meshStandardMaterial
+          transparent
+          opacity={0.28}
+          color={"#8c5aff"}
+          emissive={"#ff5050"}
+          emissiveIntensity={0.9}
+        />
+      </mesh>
+
+      {/* 3D “card” body */}
+      <mesh ref={face} castShadow receiveShadow>
+        <boxGeometry args={[1.85, 1.85, 0.22]} />
+        {/* right */}
+        <meshStandardMaterial attach="material-0" color={"#0d0d12"} />
+        {/* left */}
+        <meshStandardMaterial attach="material-1" color={"#0d0d12"} />
+        {/* top */}
+        <meshStandardMaterial attach="material-2" color={"#101018"} />
+        {/* bottom */}
+        <meshStandardMaterial attach="material-3" color={"#101018"} />
+        {/* front (your image) */}
+        <meshStandardMaterial
+          attach="material-4"
+          map={tex}
+          roughness={0.35}
+          metalness={0.15}
+          emissive={new THREE.Color("#111114")}
+          emissiveIntensity={0.35}
+        />
+        {/* back */}
+        <meshStandardMaterial attach="material-5" color={"#0b0b10"} />
+      </mesh>
+
+      {/* subtle rim light feel */}
+      <mesh position={[0, 0, 0.13]}>
+        <planeGeometry args={[1.92, 1.92]} />
+        <meshStandardMaterial
+          transparent
+          opacity={0.10}
+          color={"white"}
+          emissive={"#8c5aff"}
+          emissiveIntensity={0.6}
+        />
+      </mesh>
+
+      <Sparkles
+        count={speaking ? 120 : 70}
+        scale={[4, 4, 2]}
+        size={speaking ? 2.0 : 1.2}
+        speed={speaking ? 0.9 : 0.6}
+        opacity={0.7}
+        color={"#bfa6ff"}
+      />
+    </group>
+  );
+}
+
+/**
+ * Subtitle bubble (big, proportional to avatar):
+ * - Types in as Ghost speaks
+ * - Then fades out and clears
+ */
+function SpeakingBubble({
+  text,
+  visible,
+}: {
+  text: string;
+  visible: boolean;
+}) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 14, scale: 0.98 }}
+      animate={{ opacity: visible ? 1 : 0, y: visible ? 0 : 14, scale: visible ? 1 : 0.98 }}
+      transition={{ duration: 0.25 }}
+      style={{
+        position: "absolute",
+        left: 24,
+        right: 24,
+        bottom: 18,
+        padding: "18px 18px",
+        borderRadius: 18,
+        border: "1px solid rgba(255,255,255,0.14)",
+        background:
+          "linear-gradient(180deg, rgba(255,255,255,0.08), rgba(0,0,0,0.40))",
+        boxShadow: "0 20px 60px rgba(0,0,0,0.65)",
+        pointerEvents: "none",
+      }}
+    >
+      <div style={{ fontWeight: 900, opacity: 0.8, marginBottom: 6, letterSpacing: 0.3 }}>
+        Ghost
+      </div>
+      <div
         style={{
-          width: "100%",
-          height: "100%",
-          borderRadius: 26,
-          overflow: "hidden",
-          position: "relative",
-          transformStyle: "preserve-3d",
-          boxShadow:
-            "0 22px 70px rgba(0,0,0,0.70), 0 0 0 1px rgba(255,255,255,0.10) inset",
-          background:
-            "radial-gradient(120% 120% at 30% 20%, rgba(255,255,255,0.12), rgba(255,255,255,0.02))",
+          fontSize: 22, // big + readable
+          lineHeight: 1.25,
+          fontWeight: 800,
         }}
-        animate={{
-          rotateX: rot.x,
-          rotateY: rot.y,
-          scale: speaking ? 1.03 : 1,
-        }}
-        transition={{ type: "spring", stiffness: 140, damping: 14 }}
       >
-        {/* glow */}
-        <motion.div
-          style={{
-            position: "absolute",
-            inset: -18,
-            borderRadius: 34,
-            background:
-              "radial-gradient(circle at 30% 20%, rgba(140,90,255,0.40), transparent 55%), radial-gradient(circle at 70% 80%, rgba(255,80,80,0.22), transparent 55%)",
-            filter: "blur(12px)",
-            opacity: speaking ? 1 : 0.75,
-          }}
-          animate={{ opacity: speaking ? [0.7, 1, 0.7] : 0.75 }}
-          transition={{ duration: 0.9, repeat: speaking ? Infinity : 0 }}
-        />
-
-        {/* image */}
-        <img
-          src={src}
-          alt="Ghost"
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "cover",
-            transform: "translateZ(28px)",
-            filter: "contrast(1.06) saturate(1.06)",
-          }}
-        />
-
-        {/* blink */}
-        <div
-          style={{
-            position: "absolute",
-            left: 0,
-            right: 0,
-            top: 0,
-            height: blink ? "18%" : "0%",
-            background: "rgba(0,0,0,0.55)",
-            transition: "height 140ms ease",
-            transform: "translateZ(40px)",
-          }}
-        />
-
-        {/* shine sweep */}
-        <motion.div
-          style={{
-            position: "absolute",
-            inset: 0,
-            background:
-              "linear-gradient(120deg, transparent 30%, rgba(255,255,255,0.10) 45%, transparent 60%)",
-            transform: "translateX(-120%) translateZ(55px)",
-          }}
-          animate={{
-            transform: [
-              "translateX(-120%) translateZ(55px)",
-              "translateX(120%) translateZ(55px)",
-            ],
-          }}
-          transition={{
-            duration: 2.8,
-            repeat: Infinity,
-            repeatDelay: 1.4,
-            ease: "easeInOut",
-          }}
-        />
-      </motion.div>
+        {text}
+      </div>
     </motion.div>
   );
 }
@@ -220,16 +273,10 @@ export default function Page() {
   const [agents, setAgents] = useState<Agent[]>(initialAgents);
 
   const [heat, setHeat] = useState<number>(() => localGet("ghost.heat", 22));
-  const [speaking, setSpeaking] = useState(false);
 
   const [messages, setMessages] = useState<Msg[]>(() =>
     localGet("ghost.messages", [
-      {
-        id: 1,
-        speaker: "Ghost",
-        text: "I’m online. Give me the objective. I’ll run the team.",
-        time: nowTime(),
-      },
+      { id: 1, speaker: "Ghost", text: "I’m online. Give me the objective. I’ll run the team.", time: nowTime() },
     ])
   );
 
@@ -239,7 +286,14 @@ export default function Page() {
 
   const [input, setInput] = useState("");
 
+  // speaking bubble state
+  const [speaking, setSpeaking] = useState(false);
+  const [bubbleVisible, setBubbleVisible] = useState(false);
+  const [bubbleText, setBubbleText] = useState("");
+
   const chatRef = useRef<HTMLDivElement | null>(null);
+  const typingTimer = useRef<number | null>(null);
+  const hideTimer = useRef<number | null>(null);
 
   useEffect(() => localSet("ghost.messages", messages), [messages]);
   useEffect(() => localSet("ghost.heat", heat), [heat]);
@@ -261,44 +315,76 @@ export default function Page() {
   }, []);
 
   const addMsg = (speaker: "Ghost" | "You", text: string) => {
-    setMessages((prev) => [
-      ...prev,
-      { id: Date.now(), speaker, text, time: nowTime() },
-    ]);
+    setMessages((prev) => [...prev, { id: Date.now(), speaker, text, time: nowTime() }]);
+  };
 
-    if (speaker === "Ghost") {
-      setSpeaking(true);
-      window.setTimeout(() => setSpeaking(false), 900);
-    }
+  /** Ghost "talking" effect:
+   * - Bubble appears
+   * - Typewriter fills bubble
+   * - After finished, bubble fades away
+   * - Message still logged in chat
+   */
+  const speak = (full: string) => {
+    // cleanup any previous timers
+    if (typingTimer.current) window.clearInterval(typingTimer.current);
+    if (hideTimer.current) window.clearTimeout(hideTimer.current);
+
+    setSpeaking(true);
+    setBubbleVisible(true);
+    setBubbleText("");
+
+    let i = 0;
+    const speed = 18; // fast enough to feel real
+    typingTimer.current = window.setInterval(() => {
+      i++;
+      setBubbleText(full.slice(0, i));
+      if (i >= full.length) {
+        if (typingTimer.current) window.clearInterval(typingTimer.current);
+        typingTimer.current = null;
+
+        // finish speaking shortly after
+        setSpeaking(false);
+
+        // bubble disappears after a moment
+        hideTimer.current = window.setTimeout(() => {
+          setBubbleVisible(false);
+          setBubbleText("");
+          hideTimer.current = null;
+        }, 1200);
+      }
+    }, speed);
+
+    // also log to chat immediately (so it’s always recorded)
+    addMsg("Ghost", full);
   };
 
   const routeGhost = (userText: string) => {
     const t = userText.toLowerCase();
 
-    // quick “delegation” simulation
     if (t.includes("botox") || t.includes("med spa") || t.includes("aesthetics")) {
       setAgents((prev) =>
         prev.map((a) =>
           a.id === "lead" || a.id === "outreach" ? { ...a, status: "Working" } : a
         )
       );
-      setHeat((h) => clamp(h + 8, 0, 100));
-      return "Copy. We’re running Botox lead gen. Tell me the city (Austin/Houston/Dallas/San Antonio) and your offer (free consult / booked appts / pay-per-lead).";
+      setHeat((h) => clamp(h + 10, 0, 100));
+      return "Copy. We’re running Botox lead gen. Pick ONE city right now: Austin, Houston, Dallas, or San Antonio. Then tell me your offer: free consult, booked appointments, or pay-per-lead.";
     }
 
-    if (t.includes("plan") || t.includes("today")) {
-      setHeat((h) => clamp(h + 5, 0, 100));
-      return "Here’s the move: 1) pick 1 city, 2) pull 30 clinics, 3) send 30 DMs + 30 emails, 4) follow up at 6 hours. I’ll format scripts if you say the offer.";
+    if (t.includes("plan") || t.includes("today") || t.includes("48")) {
+      setHeat((h) => clamp(h + 7, 0, 100));
+      return "48-hour plan: 1) pick one city, 2) list 30 clinics, 3) send 30 DMs + 30 emails, 4) follow up in 6 hours, 5) close 1 clinic on a trial. Tell me city + offer and I’ll generate the exact scripts.";
     }
 
     if (t.includes("quote")) {
       const q = quoteBank[Math.floor(Math.random() * quoteBank.length)];
       setBroadcast(q);
+      setHeat((h) => clamp(h + 3, 0, 100));
       return q;
     }
 
     setHeat((h) => clamp(h + 2, 0, 100));
-    return "Objective received. Be specific: city + offer + goal for the next 48 hours.";
+    return "Objective received. Be specific: city + offer + money target for the next 48 hours.";
   };
 
   const send = () => {
@@ -307,18 +393,18 @@ export default function Page() {
     setInput("");
     addMsg("You", txt);
 
-    // ghost reply (simulate)
+    // ghost responds
     window.setTimeout(() => {
       const reply = routeGhost(txt);
-      addMsg("Ghost", reply);
-    }, 420);
+      speak(reply);
+    }, 380);
   };
 
   const shell = {
     page: {
       height: "100vh",
       display: "grid",
-      gridTemplateColumns: "260px 1fr 360px",
+      gridTemplateColumns: "260px 1fr 380px",
       gap: 18,
       padding: 18,
       background:
@@ -423,48 +509,84 @@ export default function Page() {
 
       {/* CENTER */}
       <main style={{ ...shell.panel, display: "grid", gridTemplateRows: "auto 1fr auto" }}>
-        {/* header */}
+        {/* header with BIG 3D Ghost */}
         <div
           style={{
             padding: 16,
-            display: "flex",
-            alignItems: "center",
-            gap: 14,
             borderBottom: "1px solid rgba(255,255,255,0.08)",
-            background: "rgba(0,0,0,0.15)",
+            background: "rgba(0,0,0,0.16)",
           }}
         >
-          <GhostAvatar
-            src="/Ghost2.png"
-            size={160}
-            speaking={speaking}
-            onClick={() => addMsg("Ghost", quoteBank[Math.floor(Math.random() * quoteBank.length)])}
-          />
-
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 900, fontSize: 18 }}>Ghost (COO)</div>
-            <div style={{ opacity: 0.75, fontSize: 13 }}>
-              Live Broadcast: <span style={{ opacity: 1 }}>{broadcast}</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 900, fontSize: 18 }}>Ghost (COO)</div>
+              <div style={{ opacity: 0.75, fontSize: 13 }}>
+                Live Broadcast: <span style={{ opacity: 1 }}>{broadcast}</span>
+              </div>
             </div>
+
+            <button
+              onClick={() => speak(quoteBank[Math.floor(Math.random() * quoteBank.length)])}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 12,
+                border: "1px solid rgba(255,255,255,0.14)",
+                background: "rgba(255,255,255,0.06)",
+                color: "white",
+                cursor: "pointer",
+                fontWeight: 800,
+              }}
+            >
+              Random Quote
+            </button>
           </div>
 
-          <button
-            onClick={() => addMsg("Ghost", quoteBank[Math.floor(Math.random() * quoteBank.length)])}
+          {/* HUGE 3D stage */}
+          <div
             style={{
-              padding: "10px 12px",
-              borderRadius: 12,
-              border: "1px solid rgba(255,255,255,0.14)",
-              background: "rgba(255,255,255,0.06)",
-              color: "white",
-              cursor: "pointer",
-              fontWeight: 800,
+              marginTop: 14,
+              height: 420, // BIG stage
+              borderRadius: 18,
+              border: "1px solid rgba(255,255,255,0.10)",
+              background:
+                "radial-gradient(900px 420px at 30% 10%, rgba(140,90,255,0.18), transparent 60%), radial-gradient(700px 360px at 70% 30%, rgba(255,80,80,0.10), transparent 60%), rgba(255,255,255,0.02)",
+              overflow: "hidden",
+              position: "relative",
             }}
           >
-            Random Quote
-          </button>
+            {/* speaking subtitle bubble (big, proportional) */}
+            <SpeakingBubble text={bubbleText} visible={bubbleVisible} />
+
+            <Canvas
+              shadows
+              camera={{ position: [0, 0.2, 3.2], fov: 40 }}
+              style={{ width: "100%", height: "100%" }}
+            >
+              <color attach="background" args={["#05050a"]} />
+              <ambientLight intensity={0.35} />
+              <directionalLight position={[3, 3, 2]} intensity={1.15} castShadow />
+              <pointLight position={[-3, 1, 2]} intensity={0.8} color={"#8c5aff"} />
+              <pointLight position={[2, -1, 2]} intensity={0.6} color={"#ff5050"} />
+
+              <Ghost3D
+                speaking={speaking}
+                mood={heat}
+                onClick={() => speak(quoteBank[Math.floor(Math.random() * quoteBank.length)])}
+              />
+
+              {/* subtle floor */}
+              <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -1.25, 0]} receiveShadow>
+                <planeGeometry args={[12, 12]} />
+                <meshStandardMaterial color={"#07070a"} roughness={1} metalness={0} />
+              </mesh>
+
+              {/* optional environment (no network fetch) */}
+              <Environment preset="city" />
+            </Canvas>
+          </div>
         </div>
 
-        {/* chat */}
+        {/* chat log */}
         <div
           ref={chatRef}
           style={{
@@ -486,11 +608,8 @@ export default function Page() {
                   padding: "12px 12px",
                   borderRadius: 14,
                   border: "1px solid rgba(255,255,255,0.10)",
-                  background:
-                    m.speaker === "Ghost"
-                      ? "rgba(255,255,255,0.06)"
-                      : "rgba(140,90,255,0.10)",
-                  maxWidth: 760,
+                  background: m.speaker === "Ghost" ? "rgba(255,255,255,0.06)" : "rgba(140,90,255,0.10)",
+                  maxWidth: 920,
                 }}
               >
                 {m.text}
@@ -531,8 +650,7 @@ export default function Page() {
               padding: "12px 14px",
               borderRadius: 14,
               border: "1px solid rgba(255,255,255,0.14)",
-              background:
-                "linear-gradient(90deg, rgba(140,90,255,0.9), rgba(120,80,255,0.65))",
+              background: "linear-gradient(90deg, rgba(140,90,255,0.9), rgba(120,80,255,0.65))",
               color: "white",
               cursor: "pointer",
               fontWeight: 900,
@@ -586,8 +704,9 @@ export default function Page() {
 
         <div style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid rgba(255,255,255,0.08)" }}>
           <div style={{ fontSize: 12, opacity: 0.75 }}>
-            Tip: Your Ghost image is loading from <b>/public/Ghost2.png</b>.  
-            If you upload a new one later, keep the same filename to swap instantly.
+            Ghost is loaded from <b>/public/Ghost2.png</b>.
+            <br />
+            Keep the same filename to swap art instantly later.
           </div>
         </div>
       </aside>
