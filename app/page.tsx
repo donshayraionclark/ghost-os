@@ -2,23 +2,14 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
-import { Environment, OrbitControls, useGLTF } from "@react-three/drei";
+import {
+  Bounds,
+  Environment,
+  OrbitControls,
+  useGLTF,
+  Center,
+} from "@react-three/drei";
 import * as THREE from "three";
-
-/**
- * Ghost OS — 3D Ghost (GLB) + reactive talking bubble + typewriter speech
- *
- * Requirements:
- * 1) public/Ghost.glb exists
- * 2) npm install three @react-three/fiber @react-three/drei
- *
- * Notes:
- * - “Mouth animation” depends on whether your GLB has face/jaw bones or morph targets.
- * - This code provides:
- *   - Always-on idle motion (alive)
- *   - Talking motion synced to speaking (head/body + pulse)
- *   - Speech bubble with typewriter + fade out
- */
 
 type Msg = {
   id: number;
@@ -32,7 +23,6 @@ function nowTime() {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-// Tight, “operator” quote bank (you can expand)
 const QUOTES = [
   "Pressure exposes who you really are.",
   "Build systems. Stop begging for motivation.",
@@ -46,7 +36,34 @@ function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
 }
 
-/** ===== 3D GHOST MODEL ===== */
+/** ---------------- SPEECH ENGINE (voice + timing) ---------------- */
+function canSpeak() {
+  return typeof window !== "undefined" && "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
+}
+
+function makeUtterance(text: string) {
+  const u = new SpeechSynthesisUtterance(text);
+  // Tweak these for vibe
+  u.rate = 1.0;   // 0.8 slower / 1.1 faster
+  u.pitch = 0.85; // lower = more “Ghost-ish”
+  u.volume = 1.0;
+  return u;
+}
+
+/**
+ * We want: text types AND disappears while speaking.
+ * Simple approach:
+ * - We estimate duration from character count
+ * - While speaking, we show a “remaining” substring that shrinks from the left
+ */
+function estimateMs(text: string) {
+  // ~14 chars/sec baseline at rate ~1.0 (rough)
+  const cps = 14;
+  const ms = (text.length / cps) * 1000;
+  return clamp(ms, 1200, 9000);
+}
+
+/** ---------------- 3D GHOST MODEL ---------------- */
 function GhostModel({
   talking,
   intensity,
@@ -54,47 +71,46 @@ function GhostModel({
   talking: boolean;
   intensity: number; // 0..1
 }) {
-  // Cache-bust trick (optional): add ?v= timestamp
-  const url = useMemo(() => `/Ghost.glb?v=${Math.floor(Date.now() / 60000)}`, []);
+  const url = useMemo(() => `/Ghost.glb`, []);
   const gltf = useGLTF(url);
 
   const group = useRef<THREE.Group>(null);
 
-  useFrame((state, delta) => {
+  useFrame((state) => {
     if (!group.current) return;
-
     const t = state.clock.getElapsedTime();
 
-    // Always-on "alive" idle motion
-    const idleBob = Math.sin(t * 1.2) * 0.03;
-    const idleTurn = Math.sin(t * 0.6) * 0.12;
+    // Idle (always alive)
+    const idleBob = Math.sin(t * 1.2) * 0.025;
+    const idleTurn = Math.sin(t * 0.5) * 0.10;
+    const idleBreath = 1 + Math.sin(t * 2.1) * 0.006;
 
-    // Talking motion (stronger)
-    const talkBob = Math.sin(t * 7.5) * 0.06 * intensity;
-    const talkNod = Math.sin(t * 9.0) * 0.18 * intensity;
-    const talkTwist = Math.sin(t * 6.2) * 0.12 * intensity;
+    // Talking (stronger)
+    const talkBob = Math.sin(t * 7.2) * 0.05 * intensity;
+    const talkNod = Math.sin(t * 8.7) * 0.20 * intensity;
+    const talkTwist = Math.sin(t * 6.1) * 0.14 * intensity;
+    const pulse = 1 + (talking ? Math.sin(t * 10.0) * 0.012 * intensity : 0);
 
-    const bob = idleBob + (talking ? talkBob : 0);
-    const turn = idleTurn + (talking ? talkTwist : 0);
-    const nod = talking ? talkNod : 0;
+    group.current.position.y = idleBob + (talking ? talkBob : 0);
+    group.current.rotation.y = idleTurn + (talking ? talkTwist : 0);
+    group.current.rotation.x = (talking ? talkNod : 0) * 0.12;
 
-    group.current.position.y = bob;
-    group.current.rotation.y = turn;
-    group.current.rotation.x = nod * 0.15;
-
-    // Subtle scale “breathing/pulse”
-    const pulse = 1 + (talking ? Math.sin(t * 10.0) * 0.01 * intensity : Math.sin(t * 2.0) * 0.005);
-    group.current.scale.setScalar(2.8 * pulse); // << 3x-ish size here
+    // Keep him big but not “head-only”
+    // (Bounds will frame the full body; this scale is safe)
+    const baseScale = 2.2; // <- adjust if needed
+    group.current.scale.setScalar(baseScale * idleBreath * pulse);
   });
 
   return (
     <group ref={group}>
-      <primitive object={gltf.scene} />
+      <Center>
+        <primitive object={gltf.scene} />
+      </Center>
     </group>
   );
 }
 
-/** ===== 3D SCENE WRAPPER ===== */
+/** ---------------- 3D STAGE ---------------- */
 function GhostStage({
   talking,
   intensity,
@@ -104,148 +120,203 @@ function GhostStage({
 }) {
   return (
     <Canvas
-      camera={{ position: [0, 1.2, 3.1], fov: 35 }}
+      camera={{ position: [0, 1.2, 4.6], fov: 32 }}
       style={{
         width: "100%",
         height: "100%",
-        background: "radial-gradient(1200px 600px at 50% 20%, rgba(140,80,255,0.18), rgba(0,0,0,0))",
+        background:
+          "radial-gradient(1200px 650px at 50% 18%, rgba(140,80,255,0.20), rgba(0,0,0,0))",
         borderRadius: 18,
       }}
     >
       {/* Lights */}
-      <ambientLight intensity={0.55} />
-      <directionalLight position={[3, 4, 2]} intensity={1.25} />
-      <pointLight position={[-2, 2, 2]} intensity={0.75} />
+      <ambientLight intensity={0.6} />
+      <directionalLight position={[3, 4, 2]} intensity={1.35} />
+      <pointLight position={[-2, 2, 2]} intensity={0.85} />
 
-      {/* Environment reflections */}
       <Environment preset="city" />
 
-      {/* Ghost */}
       <React.Suspense fallback={null}>
-        <GhostModel talking={talking} intensity={intensity} />
+        {/* Bounds auto-fits full body to camera (fixes “head-only”) */}
+        <Bounds fit clip observe margin={1.2}>
+          <GhostModel talking={talking} intensity={intensity} />
+        </Bounds>
       </React.Suspense>
 
-      {/* Controls: keeps him interactive without letting the camera get lost */}
+      {/* Keep it interactive but controlled */}
       <OrbitControls
         enablePan={false}
-        minDistance={2.2}
-        maxDistance={4.2}
-        minPolarAngle={Math.PI / 3.5}
-        maxPolarAngle={Math.PI / 2.1}
+        minDistance={3.2}
+        maxDistance={6.0}
+        minPolarAngle={Math.PI / 3.6}
+        maxPolarAngle={Math.PI / 2.05}
       />
     </Canvas>
   );
 }
 
-/** ===== SPEECH BUBBLE (typewriter + fade) ===== */
-function SpeechBubble({
+/** ---------------- SUBTITLE (types + disappears while speaking) ---------------- */
+function SubtitleBar({
   text,
   visible,
-  large,
 }: {
   text: string;
   visible: boolean;
-  large?: boolean;
 }) {
   return (
     <div
       style={{
         position: "absolute",
         left: "50%",
-        top: large ? 36 : 22,
+        bottom: 16,
         transform: "translateX(-50%)",
+        width: "min(920px, 92%)",
         pointerEvents: "none",
         opacity: visible ? 1 : 0,
-        transition: "opacity 350ms ease",
-        width: "min(820px, 92%)",
+        transition: "opacity 220ms ease",
       }}
     >
       <div
         style={{
-          margin: "0 auto",
-          borderRadius: 18,
-          padding: large ? "18px 18px" : "14px 16px",
+          padding: "14px 16px",
+          borderRadius: 16,
           background: "rgba(10,10,16,0.78)",
           border: "1px solid rgba(255,255,255,0.10)",
-          boxShadow: "0 20px 60px rgba(0,0,0,0.55)",
           backdropFilter: "blur(10px)",
-          fontSize: large ? 18 : 14,
-          lineHeight: large ? "28px" : "22px",
+          boxShadow: "0 20px 60px rgba(0,0,0,0.55)",
           color: "rgba(255,255,255,0.92)",
+          fontSize: 18,
+          lineHeight: "26px",
+          textAlign: "center",
+          minHeight: 58,
         }}
       >
         {text}
-        <span style={{ marginLeft: 6, opacity: 0.7 }} className={visible ? "animate-pulse" : ""}>
-          ▋
-        </span>
+        {visible ? <span style={{ marginLeft: 6, opacity: 0.7 }}>▋</span> : null}
       </div>
     </div>
   );
 }
 
-/** ===== MAIN PAGE ===== */
+/** ---------------- PAGE ---------------- */
 export default function Page() {
   const [messages, setMessages] = useState<Msg[]>([
-    { id: 1, speaker: "Ghost", text: "I’m online. Give me the objective. I’ll run the team.", time: nowTime() },
+    {
+      id: 1,
+      speaker: "Ghost",
+      text: "I’m online. Give me the objective. I’ll run the team.",
+      time: nowTime(),
+    },
   ]);
 
   const [input, setInput] = useState("");
 
-  // Speech bubble control
-  const [bubbleText, setBubbleText] = useState("");
-  const [bubbleVisible, setBubbleVisible] = useState(false);
-
-  // Talking animation intensity 0..1
+  // Talking state for 3D
   const [talking, setTalking] = useState(false);
   const [talkIntensity, setTalkIntensity] = useState(0);
 
-  // Typewriter lock
+  // Subtitle text
+  const [subtitle, setSubtitle] = useState("");
+  const [subtitleVisible, setSubtitleVisible] = useState(false);
+
+  // prevent overlap
   const typingRef = useRef(false);
+  const speakCancelRef = useRef<(() => void) | null>(null);
 
-  async function speak(text: string) {
-    // If already typing, ignore to prevent overlap
-    if (typingRef.current) return;
-    typingRef.current = true;
-
-    setTalking(true);
-    setBubbleVisible(true);
-    setBubbleText("");
-
-    // ramp up intensity
-    setTalkIntensity(0.2);
-    await new Promise((r) => setTimeout(r, 120));
-    setTalkIntensity(0.7);
-
-    // typewriter
-    for (let i = 1; i <= text.length; i++) {
-      setBubbleText(text.slice(0, i));
-      await new Promise((r) => setTimeout(r, 14));
-    }
-
-    // hold, then fade bubble
-    await new Promise((r) => setTimeout(r, 650));
-    setBubbleVisible(false);
-
-    // ramp down talking
-    setTalkIntensity(0.25);
-    await new Promise((r) => setTimeout(r, 180));
-    setTalkIntensity(0);
-    setTalking(false);
-
-    // clear bubble after fade
-    await new Promise((r) => setTimeout(r, 380));
-    setBubbleText("");
-
-    typingRef.current = false;
+  function addUser(text: string) {
+    setMessages((prev) => [
+      ...prev,
+      { id: Date.now(), speaker: "You", text, time: nowTime() },
+    ]);
   }
 
   async function addGhost(text: string) {
-    setMessages((prev) => [...prev, { id: Date.now(), speaker: "Ghost", text, time: nowTime() }]);
+    setMessages((prev) => [
+      ...prev,
+      { id: Date.now(), speaker: "Ghost", text, time: nowTime() },
+    ]);
     await speak(text);
   }
 
-  function addUser(text: string) {
-    setMessages((prev) => [...prev, { id: Date.now(), speaker: "You", text, time: nowTime() }]);
+  async function speak(text: string) {
+    if (typingRef.current) return;
+    typingRef.current = true;
+
+    // cancel any existing voice
+    if (canSpeak()) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {}
+    }
+    if (speakCancelRef.current) {
+      speakCancelRef.current();
+      speakCancelRef.current = null;
+    }
+
+    // Start “alive talking”
+    setTalking(true);
+    setTalkIntensity(0.25);
+    setSubtitleVisible(true);
+    setSubtitle("");
+
+    await new Promise((r) => setTimeout(r, 120));
+    setTalkIntensity(0.85);
+
+    const totalMs = estimateMs(text);
+    const start = performance.now();
+
+    // Type + disappear while speaking
+    // We show the “remaining” substring that shrinks from the left over time.
+    let raf = 0;
+    const tick = () => {
+      const elapsed = performance.now() - start;
+      const p = clamp(elapsed / totalMs, 0, 1);
+      const idx = Math.floor(p * text.length);
+
+      // Remaining substring (disappears as it’s said)
+      const remaining = text.slice(idx);
+      setSubtitle(remaining.length ? remaining : "");
+
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+
+    raf = requestAnimationFrame(tick);
+    speakCancelRef.current = () => cancelAnimationFrame(raf);
+
+    // Voice (optional, but you asked for it)
+    let voiceDone = false;
+    if (canSpeak()) {
+      const u = makeUtterance(text);
+      u.onend = () => {
+        voiceDone = true;
+      };
+      u.onerror = () => {
+        voiceDone = true;
+      };
+      try {
+        window.speechSynthesis.speak(u);
+      } catch {
+        voiceDone = true;
+      }
+    } else {
+      // no speech support; just use timer
+      voiceDone = true;
+    }
+
+    // Wait until estimated duration passes (and voice finishes if possible)
+    await new Promise((r) => setTimeout(r, totalMs));
+
+    // clean up subtitle
+    setSubtitle("");
+    setSubtitleVisible(false);
+
+    // ramp down talking
+    setTalkIntensity(0.25);
+    await new Promise((r) => setTimeout(r, 160));
+    setTalkIntensity(0);
+    setTalking(false);
+
+    typingRef.current = false;
   }
 
   async function onSend() {
@@ -254,8 +325,8 @@ export default function Page() {
     setInput("");
     addUser(t);
 
-    // Simple “operator router” (you can expand later)
     const lower = t.toLowerCase();
+
     if (lower.includes("quote")) {
       const q = QUOTES[Math.floor(Math.random() * QUOTES.length)];
       await addGhost(q);
@@ -264,33 +335,26 @@ export default function Page() {
 
     if (lower.includes("botox") || lower.includes("lead")) {
       await addGhost("Objective locked. We sell booked consults first. Prove results. Then scale.");
-      await addGhost("Next move: send 10 DMs today. Offer 1–2 free booked consults to test quality.");
+      await addGhost("Next move: 10 DMs today. Offer 1–2 free booked consults to test quality.");
       return;
     }
 
     await addGhost("Say the objective in one line. City + offer + what you want done next.");
   }
 
-  // Auto “random quote” every ~25s to keep him alive
+  // Random quote drip (keeps him alive)
   useEffect(() => {
     const id = setInterval(() => {
       if (typingRef.current) return;
       const q = QUOTES[Math.floor(Math.random() * QUOTES.length)];
       addGhost(q);
-    }, 25000);
+    }, 28000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "#07070a",
-        color: "white",
-        padding: 18,
-      }}
-    >
+    <div style={{ minHeight: "100vh", background: "#07070a", color: "white", padding: 18 }}>
       <div
         style={{
           maxWidth: 1400,
@@ -300,7 +364,7 @@ export default function Page() {
           gap: 16,
         }}
       >
-        {/* LEFT NAV */}
+        {/* LEFT */}
         <div
           style={{
             borderRadius: 18,
@@ -341,68 +405,67 @@ export default function Page() {
           <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.10)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
               <div style={{ opacity: 0.8, fontWeight: 700 }}>Heat</div>
-              <div style={{ opacity: 0.75 }}>{Math.round(clamp(35 + talkIntensity * 30, 0, 100))}</div>
+              <div style={{ opacity: 0.75 }}>{Math.round(clamp(35 + talkIntensity * 55, 0, 100))}/100</div>
             </div>
             <div style={{ marginTop: 10, height: 10, borderRadius: 999, background: "rgba(255,255,255,0.08)" }}>
               <div
                 style={{
                   height: "100%",
-                  width: `${Math.round(clamp(35 + talkIntensity * 30, 0, 100))}%`,
+                  width: `${Math.round(clamp(35 + talkIntensity * 55, 0, 100))}%`,
                   borderRadius: 999,
                   background: "linear-gradient(90deg, rgba(140,80,255,0.9), rgba(255,80,140,0.85))",
                 }}
               />
             </div>
+
+            <div style={{ marginTop: 12, opacity: 0.7, fontSize: 12, lineHeight: "18px" }}>
+              Tips:
+              <div>• Model loads from <code>/public/Ghost.glb</code></div>
+              <div>• If it doesn’t update on localhost: stop dev → replace file → restart → hard refresh</div>
+            </div>
           </div>
         </div>
 
-        {/* CENTER: 3D + CHAT */}
+        {/* CENTER */}
         <div style={{ display: "grid", gap: 14 }}>
-          {/* 3D STAGE */}
+          {/* STAGE */}
           <div
             style={{
               position: "relative",
-              height: 420, // large hero area
+              height: 520,
               borderRadius: 18,
               border: "1px solid rgba(255,255,255,0.10)",
               background: "rgba(10,10,14,0.55)",
               overflow: "hidden",
             }}
           >
-            {/* Speech bubble sits OVER the 3D scene */}
-            <SpeechBubble text={bubbleText} visible={bubbleVisible} large />
-
-            <div style={{ position: "absolute", left: 14, top: 12 }}>
+            <div style={{ position: "absolute", left: 14, top: 12, zIndex: 5 }}>
               <div style={{ fontWeight: 900, fontSize: 22 }}>Ghost (COO)</div>
-              <div style={{ opacity: 0.7, fontSize: 12 }}>Live: reactive 3D operator</div>
+              <div style={{ opacity: 0.7, fontSize: 12 }}>Full-body 3D + voice + alive motion</div>
             </div>
 
-            <div style={{ position: "absolute", right: 14, top: 14, display: "flex", gap: 10 }}>
-              <button
-                onClick={() => addGhost(QUOTES[Math.floor(Math.random() * QUOTES.length)])}
-                style={pillBtn}
-              >
+            <div style={{ position: "absolute", right: 14, top: 14, display: "flex", gap: 10, zIndex: 5 }}>
+              <button onClick={() => addGhost(QUOTES[Math.floor(Math.random() * QUOTES.length)])} style={pillBtn}>
                 Random Quote
               </button>
             </div>
 
+            {/* Subtitle that types + disappears as he speaks */}
+            <SubtitleBar text={subtitle} visible={subtitleVisible} />
+
             <div style={{ position: "absolute", inset: 0, paddingTop: 56 }}>
               <GhostStage talking={talking} intensity={talkIntensity} />
             </div>
-
-            <div style={{ position: "absolute", bottom: 12, left: 14, opacity: 0.7, fontSize: 12 }}>
-              Model loaded from <code>/public/Ghost.glb</code>
-            </div>
           </div>
 
-          {/* CHAT LOG */}
+          {/* CHAT */}
           <div
             style={{
               borderRadius: 18,
               border: "1px solid rgba(255,255,255,0.10)",
               background: "rgba(10,10,14,0.70)",
               padding: 14,
-              height: 420,
+              height: 360,
               overflow: "auto",
             }}
           >
@@ -425,7 +488,16 @@ export default function Page() {
                     border: m.speaker === "You" ? "none" : "1px solid rgba(255,255,255,0.10)",
                   }}
                 >
-                  <div style={{ opacity: 0.65, fontSize: 11, marginBottom: 6, display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <div
+                    style={{
+                      opacity: 0.65,
+                      fontSize: 11,
+                      marginBottom: 6,
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: 10,
+                    }}
+                  >
                     <span style={{ fontWeight: 800 }}>{m.speaker}</span>
                     <span>{m.time}</span>
                   </div>
@@ -470,7 +542,7 @@ export default function Page() {
           </div>
         </div>
 
-        {/* RIGHT TEAM */}
+        {/* RIGHT */}
         <div
           style={{
             borderRadius: 18,
@@ -509,8 +581,9 @@ export default function Page() {
             </div>
           ))}
 
-          <div style={{ marginTop: 14, fontSize: 12, opacity: 0.75 }}>
-            Tip: Keep your model file named exactly <code>Ghost.glb</code> inside <code>/public</code>.
+          <div style={{ marginTop: 14, fontSize: 12, opacity: 0.75, lineHeight: "18px" }}>
+            Voice uses your browser’s speech engine. For “real mouth movement” you’ll need a rigged model
+            with visemes/blendshapes (we can hook those up next once your GLB includes them).
           </div>
         </div>
       </div>
@@ -550,5 +623,5 @@ function navBtnStyle(active: boolean): React.CSSProperties {
   };
 }
 
-// Needed for drei GLTF loader types
+// Preload
 useGLTF.preload("/Ghost.glb");
