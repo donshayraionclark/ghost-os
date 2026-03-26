@@ -2,584 +2,553 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
-import { Environment, Float, Html, OrbitControls, Sparkles, useGLTF } from "@react-three/drei";
+import { Environment, OrbitControls, useGLTF } from "@react-three/drei";
 import * as THREE from "three";
-import { motion, AnimatePresence } from "framer-motion";
 
 /**
- * Ghost OS — 3D COO Stage (Next.js App Router, Vercel-safe)
- * - BIG 3D stage (no “box frame”)
- * - Constant idle reactions: breathing, float, micro-tilt, eye/attention vibe
- * - Voice (Web Speech API)
- * - Speech text: type-on while speaking, then fades out
- * - If /public/ghost.glb exists -> loads it; otherwise uses /public/Ghost2.png fallback
+ * Ghost OS — 3D Ghost (GLB) + reactive talking bubble + typewriter speech
  *
- * IMPORTANT:
- * - True mouth/face animation requires a rigged model w/ morph targets (visemes).
- * - If your GLB has morph targets, this code will try a few common names.
+ * Requirements:
+ * 1) public/Ghost.glb exists
+ * 2) npm install three @react-three/fiber @react-three/drei
+ *
+ * Notes:
+ * - “Mouth animation” depends on whether your GLB has face/jaw bones or morph targets.
+ * - This code provides:
+ *   - Always-on idle motion (alive)
+ *   - Talking motion synced to speaking (head/body + pulse)
+ *   - Speech bubble with typewriter + fade out
  */
 
-type SpeakState = { text: string; visibleText: string; active: boolean };
+type Msg = {
+  id: number;
+  speaker: "Ghost" | "You";
+  text: string;
+  time: string;
+};
 
+function nowTime() {
+  const d = new Date();
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// Tight, “operator” quote bank (you can expand)
 const QUOTES = [
   "Pressure exposes who you really are.",
   "Build systems. Stop begging for motivation.",
-  "Move first. Explain later.",
-  "If it’s not disciplined, it’s not real.",
-  "The goal is simple: execute.",
-  "One clean move beats ten loud plans.",
+  "One objective. One move. Execute.",
+  "Talk less. Move cleaner.",
+  "Win the hour. Stack the day.",
+  "Speed with control.",
 ];
-
-function useIsMounted() {
-  const r = useRef(false);
-  useEffect(() => {
-    r.current = true;
-    return () => {
-      r.current = false;
-    };
-  }, []);
-  return r;
-}
 
 function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
 }
 
-/** ---------- 3D MODEL (GLB) ---------- */
+/** ===== 3D GHOST MODEL ===== */
 function GhostModel({
-  speakingIntensity,
-  lookAt,
-  onLoaded,
+  talking,
+  intensity,
 }: {
-  speakingIntensity: number;
-  lookAt: THREE.Vector3;
-  onLoaded?: (hasMorphs: boolean) => void;
+  talking: boolean;
+  intensity: number; // 0..1
 }) {
-  // If ghost.glb doesn't exist, Drei will throw; we catch in parent by conditional rendering.
-  const gltf = useGLTF("/ghost.glb") as any;
+  // Cache-bust trick (optional): add ?v= timestamp
+  const url = useMemo(() => `/Ghost.glb?v=${Math.floor(Date.now() / 60000)}`, []);
+  const gltf = useGLTF(url);
 
   const group = useRef<THREE.Group>(null);
-  const [hasMorphs, setHasMorphs] = useState(false);
-  const mouthTargetsRef = useRef<{ mesh: THREE.Mesh; dict: any; infl: any }[]>([]);
 
-  useEffect(() => {
-    const targets: { mesh: THREE.Mesh; dict: any; infl: any }[] = [];
-    let found = false;
-
-    gltf.scene.traverse((obj: any) => {
-      if (obj && obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences) {
-        found = true;
-        targets.push({ mesh: obj, dict: obj.morphTargetDictionary, infl: obj.morphTargetInfluences });
-      }
-    });
-
-    mouthTargetsRef.current = targets;
-    setHasMorphs(found);
-    onLoaded?.(found);
-  }, [gltf, onLoaded]);
-
-  // Try to drive mouth morph targets with a few common names
-  const setMouth = (value: number) => {
-    const v = clamp(value, 0, 1);
-    for (const t of mouthTargetsRef.current) {
-      const d = t.dict;
-      const i = t.infl;
-
-      // Common morph names across exporters
-      const candidates = [
-        "mouthOpen",
-        "jawOpen",
-        "JawOpen",
-        "viseme_aa",
-        "viseme_AA",
-        "A",
-        "aa",
-        "vrc.v_aa",
-      ];
-
-      for (const name of candidates) {
-        const idx = d?.[name];
-        if (typeof idx === "number") {
-          i[idx] = v;
-        }
-      }
-    }
-  };
-
-  useFrame((state, dt) => {
+  useFrame((state, delta) => {
     if (!group.current) return;
 
-    // Always “alive”
     const t = state.clock.getElapsedTime();
 
-    // Subtle torso breathing + micro-sway
-    group.current.rotation.y = THREE.MathUtils.lerp(group.current.rotation.y, (state.pointer.x * 0.25) as number, 0.06);
-    group.current.rotation.x = THREE.MathUtils.lerp(group.current.rotation.x, (-state.pointer.y * 0.12) as number, 0.06);
+    // Always-on "alive" idle motion
+    const idleBob = Math.sin(t * 1.2) * 0.03;
+    const idleTurn = Math.sin(t * 0.6) * 0.12;
 
-    // Look-at (camera-ish)
-    group.current.lookAt(lookAt);
+    // Talking motion (stronger)
+    const talkBob = Math.sin(t * 7.5) * 0.06 * intensity;
+    const talkNod = Math.sin(t * 9.0) * 0.18 * intensity;
+    const talkTwist = Math.sin(t * 6.2) * 0.12 * intensity;
 
-    // Mouth drive (only meaningful if morphs exist)
-    const mouth = 0.12 + speakingIntensity * 0.85 + Math.abs(Math.sin(t * 6)) * (speakingIntensity * 0.15);
-    setMouth(mouth);
+    const bob = idleBob + (talking ? talkBob : 0);
+    const turn = idleTurn + (talking ? talkTwist : 0);
+    const nod = talking ? talkNod : 0;
+
+    group.current.position.y = bob;
+    group.current.rotation.y = turn;
+    group.current.rotation.x = nod * 0.15;
+
+    // Subtle scale “breathing/pulse”
+    const pulse = 1 + (talking ? Math.sin(t * 10.0) * 0.01 * intensity : Math.sin(t * 2.0) * 0.005);
+    group.current.scale.setScalar(2.8 * pulse); // << 3x-ish size here
   });
 
   return (
-    <group ref={group} position={[0, -1.35, 0]} scale={1.75}>
+    <group ref={group}>
       <primitive object={gltf.scene} />
-      {!hasMorphs ? null : null}
     </group>
   );
 }
 
-/** ---------- 2D FALLBACK (if no GLB) ---------- */
-function GhostCard2D({ speakingIntensity }: { speakingIntensity: number }) {
-  // “Fake mouth” via subtle scale/brightness pulsing
+/** ===== 3D SCENE WRAPPER ===== */
+function GhostStage({
+  talking,
+  intensity,
+}: {
+  talking: boolean;
+  intensity: number;
+}) {
+  return (
+    <Canvas
+      camera={{ position: [0, 1.2, 3.1], fov: 35 }}
+      style={{
+        width: "100%",
+        height: "100%",
+        background: "radial-gradient(1200px 600px at 50% 20%, rgba(140,80,255,0.18), rgba(0,0,0,0))",
+        borderRadius: 18,
+      }}
+    >
+      {/* Lights */}
+      <ambientLight intensity={0.55} />
+      <directionalLight position={[3, 4, 2]} intensity={1.25} />
+      <pointLight position={[-2, 2, 2]} intensity={0.75} />
+
+      {/* Environment reflections */}
+      <Environment preset="city" />
+
+      {/* Ghost */}
+      <React.Suspense fallback={null}>
+        <GhostModel talking={talking} intensity={intensity} />
+      </React.Suspense>
+
+      {/* Controls: keeps him interactive without letting the camera get lost */}
+      <OrbitControls
+        enablePan={false}
+        minDistance={2.2}
+        maxDistance={4.2}
+        minPolarAngle={Math.PI / 3.5}
+        maxPolarAngle={Math.PI / 2.1}
+      />
+    </Canvas>
+  );
+}
+
+/** ===== SPEECH BUBBLE (typewriter + fade) ===== */
+function SpeechBubble({
+  text,
+  visible,
+  large,
+}: {
+  text: string;
+  visible: boolean;
+  large?: boolean;
+}) {
   return (
     <div
       style={{
-        width: "min(760px, 86vw)",
-        height: "min(560px, 60vh)",
-        display: "grid",
-        placeItems: "center",
-        position: "relative",
-        borderRadius: 28,
-        background: "radial-gradient(1200px 600px at 50% 40%, rgba(150,90,255,0.22), rgba(0,0,0,0.0))",
-        overflow: "hidden",
+        position: "absolute",
+        left: "50%",
+        top: large ? 36 : 22,
+        transform: "translateX(-50%)",
+        pointerEvents: "none",
+        opacity: visible ? 1 : 0,
+        transition: "opacity 350ms ease",
+        width: "min(820px, 92%)",
       }}
     >
       <div
         style={{
-          position: "absolute",
-          inset: 0,
-          background:
-            "radial-gradient(900px 380px at 50% 60%, rgba(255,255,255,0.06), rgba(0,0,0,0.0))",
-          pointerEvents: "none",
-        }}
-      />
-      <img
-        src="/Ghost2.png"
-        alt="Ghost"
-        style={{
-          width: "min(520px, 72vw)",
-          height: "auto",
-          transform: `translateY(${Math.sin(Date.now() / 700) * 1}px) scale(${1 + speakingIntensity * 0.01})`,
-          filter: `drop-shadow(0 30px 80px rgba(0,0,0,0.65)) brightness(${1 + speakingIntensity * 0.06})`,
-          borderRadius: 24,
-          userSelect: "none",
-        }}
-      />
-      <div
-        style={{
-          position: "absolute",
-          bottom: 26,
-          left: "50%",
-          transform: "translateX(-50%)",
-          opacity: 0.6,
-          fontSize: 12,
-          letterSpacing: "0.18em",
-          textTransform: "uppercase",
-          color: "rgba(255,255,255,0.7)",
+          margin: "0 auto",
+          borderRadius: 18,
+          padding: large ? "18px 18px" : "14px 16px",
+          background: "rgba(10,10,16,0.78)",
+          border: "1px solid rgba(255,255,255,0.10)",
+          boxShadow: "0 20px 60px rgba(0,0,0,0.55)",
+          backdropFilter: "blur(10px)",
+          fontSize: large ? 18 : 14,
+          lineHeight: large ? "28px" : "22px",
+          color: "rgba(255,255,255,0.92)",
         }}
       >
-        (Using 2D fallback — upload /public/ghost.glb for real 3D + face rig)
+        {text}
+        <span style={{ marginLeft: 6, opacity: 0.7 }} className={visible ? "animate-pulse" : ""}>
+          ▋
+        </span>
       </div>
     </div>
   );
 }
 
-/** ---------- MAIN PAGE ---------- */
+/** ===== MAIN PAGE ===== */
 export default function Page() {
-  const mounted = useIsMounted();
+  const [messages, setMessages] = useState<Msg[]>([
+    { id: 1, speaker: "Ghost", text: "I’m online. Give me the objective. I’ll run the team.", time: nowTime() },
+  ]);
 
-  const [hasGLB, setHasGLB] = useState(true); // we’ll auto-fallback if GLB load fails
-  const [hasMorphs, setHasMorphs] = useState(false);
+  const [input, setInput] = useState("");
 
-  const [speak, setSpeak] = useState<SpeakState>({ text: "", visibleText: "", active: false });
-  const [speakingIntensity, setSpeakingIntensity] = useState(0); // 0..1
-  const [heat, setHeat] = useState(53);
+  // Speech bubble control
+  const [bubbleText, setBubbleText] = useState("");
+  const [bubbleVisible, setBubbleVisible] = useState(false);
 
-  // “Look target” for the model
-  const lookAt = useMemo(() => new THREE.Vector3(0, 0.25, 2.2), []);
+  // Talking animation intensity 0..1
+  const [talking, setTalking] = useState(false);
+  const [talkIntensity, setTalkIntensity] = useState(0);
 
-  // Typewriter while speaking
-  useEffect(() => {
-    if (!speak.active) return;
+  // Typewriter lock
+  const typingRef = useRef(false);
 
-    let i = 0;
-    const text = speak.text;
-    const tick = setInterval(() => {
-      i += 1;
-      setSpeak((p) => ({ ...p, visibleText: text.slice(0, i) }));
-      // speaking intensity bumps as characters appear
-      setSpeakingIntensity((v) => clamp(v + 0.06, 0, 1));
-      if (i >= text.length) clearInterval(tick);
-    }, 22);
+  async function speak(text: string) {
+    // If already typing, ignore to prevent overlap
+    if (typingRef.current) return;
+    typingRef.current = true;
 
-    return () => clearInterval(tick);
-  }, [speak.active, speak.text]);
+    setTalking(true);
+    setBubbleVisible(true);
+    setBubbleText("");
 
-  // Speaking “decay” + idle motion feel
-  useEffect(() => {
-    const id = setInterval(() => {
-      setSpeakingIntensity((v) => clamp(v * 0.84, 0, 1));
-    }, 80);
-    return () => clearInterval(id);
-  }, []);
+    // ramp up intensity
+    setTalkIntensity(0.2);
+    await new Promise((r) => setTimeout(r, 120));
+    setTalkIntensity(0.7);
 
-  // Random quote idle chatter
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (speak.active) return;
+    // typewriter
+    for (let i = 1; i <= text.length; i++) {
+      setBubbleText(text.slice(0, i));
+      await new Promise((r) => setTimeout(r, 14));
+    }
+
+    // hold, then fade bubble
+    await new Promise((r) => setTimeout(r, 650));
+    setBubbleVisible(false);
+
+    // ramp down talking
+    setTalkIntensity(0.25);
+    await new Promise((r) => setTimeout(r, 180));
+    setTalkIntensity(0);
+    setTalking(false);
+
+    // clear bubble after fade
+    await new Promise((r) => setTimeout(r, 380));
+    setBubbleText("");
+
+    typingRef.current = false;
+  }
+
+  async function addGhost(text: string) {
+    setMessages((prev) => [...prev, { id: Date.now(), speaker: "Ghost", text, time: nowTime() }]);
+    await speak(text);
+  }
+
+  function addUser(text: string) {
+    setMessages((prev) => [...prev, { id: Date.now(), speaker: "You", text, time: nowTime() }]);
+  }
+
+  async function onSend() {
+    const t = input.trim();
+    if (!t) return;
+    setInput("");
+    addUser(t);
+
+    // Simple “operator router” (you can expand later)
+    const lower = t.toLowerCase();
+    if (lower.includes("quote")) {
       const q = QUOTES[Math.floor(Math.random() * QUOTES.length)];
-      doSpeak(q);
-    }, 18000);
+      await addGhost(q);
+      return;
+    }
+
+    if (lower.includes("botox") || lower.includes("lead")) {
+      await addGhost("Objective locked. We sell booked consults first. Prove results. Then scale.");
+      await addGhost("Next move: send 10 DMs today. Offer 1–2 free booked consults to test quality.");
+      return;
+    }
+
+    await addGhost("Say the objective in one line. City + offer + what you want done next.");
+  }
+
+  // Auto “random quote” every ~25s to keep him alive
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (typingRef.current) return;
+      const q = QUOTES[Math.floor(Math.random() * QUOTES.length)];
+      addGhost(q);
+    }, 25000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [speak.active]);
-
-  function doSpeak(text: string) {
-    // Start the bubble
-    setSpeak({ text, visibleText: "", active: true });
-    setHeat((h) => clamp(h + 2, 0, 100));
-
-    // Voice (Web Speech API)
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      try {
-        window.speechSynthesis.cancel();
-        const u = new SpeechSynthesisUtterance(text);
-        u.rate = 1.02;
-        u.pitch = 0.9;
-        u.volume = 1;
-        u.onstart = () => setSpeakingIntensity(0.75);
-        u.onend = () => {
-          // Fade bubble out after “speaking”
-          setTimeout(() => {
-            setSpeak((p) => ({ ...p, active: false }));
-            setTimeout(() => setSpeak({ text: "", visibleText: "", active: false }), 450);
-          }, 700);
-        };
-        window.speechSynthesis.speak(u);
-      } catch {
-        // If voice fails, still fade bubble
-        setTimeout(() => setSpeak((p) => ({ ...p, active: false })), 1400);
-      }
-    } else {
-      setTimeout(() => setSpeak((p) => ({ ...p, active: false })), 1400);
-    }
-  }
+  }, []);
 
   return (
     <div
       style={{
         minHeight: "100vh",
-        background: "radial-gradient(1200px 700px at 50% 20%, rgba(155,95,255,0.18), rgba(0,0,0,0) 60%), #07070a",
+        background: "#07070a",
         color: "white",
-        display: "grid",
-        gridTemplateColumns: "340px 1fr 360px",
-        gap: 18,
         padding: 18,
       }}
     >
-      {/* LEFT */}
       <div
         style={{
-          borderRadius: 24,
-          background: "rgba(255,255,255,0.03)",
-          border: "1px solid rgba(255,255,255,0.08)",
-          padding: 16,
+          maxWidth: 1400,
+          margin: "0 auto",
+          display: "grid",
+          gridTemplateColumns: "320px 1fr 340px",
+          gap: 16,
         }}
       >
-        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-          <div
-            style={{
-              width: 44,
-              height: 44,
-              borderRadius: 14,
-              display: "grid",
-              placeItems: "center",
-              background: "rgba(255,255,255,0.08)",
-              fontWeight: 900,
-            }}
-          >
-            G
-          </div>
-          <div>
-            <div style={{ fontWeight: 800, fontSize: 18 }}>Ghost OS</div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>COO Agent Interface</div>
-          </div>
-        </div>
-
-        <div style={{ marginTop: 16, padding: 14, borderRadius: 18, background: "rgba(0,0,0,0.35)", border: "1px solid rgba(255,255,255,0.08)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-            <div style={{ fontSize: 12, letterSpacing: "0.18em", textTransform: "uppercase", opacity: 0.7 }}>
-              Heat
-            </div>
-            <div style={{ fontWeight: 700 }}>{heat}/100</div>
-          </div>
-          <div style={{ height: 10, borderRadius: 999, background: "rgba(255,255,255,0.08)", overflow: "hidden" }}>
-            <div style={{ height: "100%", width: `${heat}%`, background: "linear-gradient(90deg, rgba(180,120,255,0.9), rgba(255,80,140,0.9))" }} />
-          </div>
-        </div>
-
-        <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7, lineHeight: 1.5 }}>
-          Tips:
-          <div>• Upload <b>/public/ghost.glb</b> for real 3D face rig.</div>
-          <div>• Your PNG stays as fallback: <b>/public/Ghost2.png</b></div>
-          <div>• Click “Random Quote” to test voice + type-speech.</div>
-        </div>
-      </div>
-
-      {/* CENTER */}
-      <div
-        style={{
-          borderRadius: 24,
-          background: "rgba(255,255,255,0.03)",
-          border: "1px solid rgba(255,255,255,0.08)",
-          overflow: "hidden",
-          position: "relative",
-        }}
-      >
-        {/* Header */}
-        <div style={{ padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div>
-            <div style={{ fontWeight: 900, fontSize: 20 }}>Ghost (COO)</div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>
-              Live Broadcast: <span style={{ opacity: 1 }}>{speak.active ? speak.visibleText || "…" : QUOTES[0]}</span>
-            </div>
-            <div style={{ fontSize: 11, opacity: 0.55, marginTop: 6 }}>
-              {hasGLB ? (hasMorphs ? "3D model loaded (morph targets detected)" : "3D model loaded (no morph targets detected)") : "2D fallback mode"}
-            </div>
-          </div>
-
-          <button
-            onClick={() => doSpeak(QUOTES[Math.floor(Math.random() * QUOTES.length)])}
-            style={{
-              padding: "10px 14px",
-              borderRadius: 14,
-              background: "rgba(255,255,255,0.06)",
-              border: "1px solid rgba(255,255,255,0.12)",
-              color: "white",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
-          >
-            Random Quote
-          </button>
-        </div>
-
-        {/* 3D Stage */}
-        <div style={{ height: "calc(100vh - 240px)", minHeight: 520, position: "relative" }}>
-          <div
-            style={{
-              position: "absolute",
-              inset: 0,
-              background:
-                "radial-gradient(1200px 600px at 50% 45%, rgba(155,95,255,0.26), rgba(0,0,0,0.0) 65%)",
-              pointerEvents: "none",
-            }}
-          />
-
-          {hasGLB ? (
-            <Canvas
-              shadows
-              camera={{ position: [0, 0.55, 3.4], fov: 40 }}
-              onCreated={() => {
-                // nothing
+        {/* LEFT NAV */}
+        <div
+          style={{
+            borderRadius: 18,
+            border: "1px solid rgba(255,255,255,0.10)",
+            background: "rgba(10,10,14,0.70)",
+            padding: 16,
+            height: "calc(100vh - 36px)",
+            position: "sticky",
+            top: 18,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+            <div
+              style={{
+                width: 42,
+                height: 42,
+                borderRadius: 14,
+                background: "rgba(255,255,255,0.10)",
+                display: "grid",
+                placeItems: "center",
+                fontWeight: 800,
               }}
             >
-              <ambientLight intensity={0.6} />
-              <directionalLight position={[4, 6, 3]} intensity={1.15} />
-              <pointLight position={[-3, 2, 2]} intensity={0.55} />
-
-              <Sparkles count={80} scale={6} size={1.2} speed={0.25} opacity={0.25} />
-
-              <Float speed={1.1} rotationIntensity={0.25} floatIntensity={0.35}>
-                <SuspenseGLB
-                  speakingIntensity={speakingIntensity}
-                  lookAt={lookAt}
-                  onModelInfo={(ok, morphs) => {
-                    if (!ok) setHasGLB(false);
-                    setHasMorphs(morphs);
-                  }}
-                />
-              </Float>
-
-              <Environment preset="city" />
-              <OrbitControls
-                enablePan={false}
-                enableZoom={false}
-                minPolarAngle={Math.PI / 2.3}
-                maxPolarAngle={Math.PI / 2.1}
-              />
-
-              {/* Speech bubble pinned near the head */}
-              <Html position={[0, 1.05, 0.6]} center>
-                <AnimatePresence>
-                  {speak.active && (
-                    <motion.div
-                      initial={{ opacity: 0, y: 10, scale: 0.98 }}
-                      animate={{ opacity: 1, y: 0, scale: 1 }}
-                      exit={{ opacity: 0, y: -10, scale: 0.98 }}
-                      transition={{ duration: 0.22 }}
-                      style={{
-                        width: "min(560px, 70vw)",
-                        padding: 14,
-                        borderRadius: 18,
-                        background: "rgba(10,10,14,0.78)",
-                        border: "1px solid rgba(255,255,255,0.14)",
-                        boxShadow: "0 20px 60px rgba(0,0,0,0.55)",
-                        fontSize: 16,
-                        lineHeight: 1.35,
-                      }}
-                    >
-                      <div style={{ fontWeight: 900, marginBottom: 6, opacity: 0.9 }}>Ghost</div>
-                      <div style={{ opacity: 0.92 }}>
-                        {speak.visibleText}
-                        <span style={{ marginLeft: 6, opacity: 0.65 }}>▋</span>
-                      </div>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </Html>
-            </Canvas>
-          ) : (
-            <div style={{ height: "100%", display: "grid", placeItems: "center" }}>
-              <GhostCard2D speakingIntensity={speakingIntensity} />
-              <div style={{ position: "absolute", top: 14, right: 14, fontSize: 12, opacity: 0.65 }}>
-                Upload <b>/public/ghost.glb</b> to enable true 3D + face
-              </div>
+              G
             </div>
-          )}
+            <div>
+              <div style={{ fontWeight: 800, fontSize: 18 }}>Ghost OS</div>
+              <div style={{ opacity: 0.65, fontSize: 12 }}>COO Agent Interface</div>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gap: 10 }}>
+            <div style={navBtnStyle(true)}>Command Chat</div>
+            <div style={navBtnStyle(false)}>Agent Team</div>
+            <div style={navBtnStyle(false)}>Execution</div>
+          </div>
+
+          <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.10)" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ opacity: 0.8, fontWeight: 700 }}>Heat</div>
+              <div style={{ opacity: 0.75 }}>{Math.round(clamp(35 + talkIntensity * 30, 0, 100))}</div>
+            </div>
+            <div style={{ marginTop: 10, height: 10, borderRadius: 999, background: "rgba(255,255,255,0.08)" }}>
+              <div
+                style={{
+                  height: "100%",
+                  width: `${Math.round(clamp(35 + talkIntensity * 30, 0, 100))}%`,
+                  borderRadius: 999,
+                  background: "linear-gradient(90deg, rgba(140,80,255,0.9), rgba(255,80,140,0.85))",
+                }}
+              />
+            </div>
+          </div>
         </div>
 
-        {/* Bottom input */}
-        <div style={{ padding: 16, borderTop: "1px solid rgba(255,255,255,0.08)", display: "flex", gap: 10 }}>
-          <input
-            placeholder='Tell Ghost what you’re working on… (ex: "Botox leads Austin")'
-            style={{
-              flex: 1,
-              padding: "12px 14px",
-              borderRadius: 14,
-              background: "rgba(0,0,0,0.35)",
-              border: "1px solid rgba(255,255,255,0.10)",
-              color: "white",
-              outline: "none",
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                const v = (e.currentTarget as HTMLInputElement).value.trim();
-                if (!v) return;
-                doSpeak(`Objective received: ${v}. I’m delegating now. Next move: send 10 DMs today.`);
-                (e.currentTarget as HTMLInputElement).value = "";
-              }
-            }}
-          />
-          <button
-            style={{
-              padding: "12px 16px",
-              borderRadius: 14,
-              background: "linear-gradient(90deg, rgba(140,90,255,1), rgba(255,80,140,1))",
-              border: "none",
-              color: "white",
-              fontWeight: 900,
-              cursor: "pointer",
-            }}
-            onClick={() => doSpeak("Locked in. Move with discipline.")}
-          >
-            Send
-          </button>
-        </div>
-      </div>
-
-      {/* RIGHT */}
-      <div
-        style={{
-          borderRadius: 24,
-          background: "rgba(255,255,255,0.03)",
-          border: "1px solid rgba(255,255,255,0.08)",
-          padding: 16,
-        }}
-      >
-        <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 12 }}>Team</div>
-        {[
-          { name: "Lead Gen", text: "Find & qualify Botox/MedSpa buyers", status: "Idle" },
-          { name: "Outreach", text: "DM/SMS/Email scripts + follow-ups", status: "Idle" },
-          { name: "Ops", text: "Task routing + checklists", status: "Idle" },
-          { name: "Research", text: "Offers, pricing, competitors", status: "Idle" },
-          { name: "Automation", text: "Connect tools + reduce manual work", status: "Idle" },
-        ].map((a) => (
+        {/* CENTER: 3D + CHAT */}
+        <div style={{ display: "grid", gap: 14 }}>
+          {/* 3D STAGE */}
           <div
-            key={a.name}
+            style={{
+              position: "relative",
+              height: 420, // large hero area
+              borderRadius: 18,
+              border: "1px solid rgba(255,255,255,0.10)",
+              background: "rgba(10,10,14,0.55)",
+              overflow: "hidden",
+            }}
+          >
+            {/* Speech bubble sits OVER the 3D scene */}
+            <SpeechBubble text={bubbleText} visible={bubbleVisible} large />
+
+            <div style={{ position: "absolute", left: 14, top: 12 }}>
+              <div style={{ fontWeight: 900, fontSize: 22 }}>Ghost (COO)</div>
+              <div style={{ opacity: 0.7, fontSize: 12 }}>Live: reactive 3D operator</div>
+            </div>
+
+            <div style={{ position: "absolute", right: 14, top: 14, display: "flex", gap: 10 }}>
+              <button
+                onClick={() => addGhost(QUOTES[Math.floor(Math.random() * QUOTES.length)])}
+                style={pillBtn}
+              >
+                Random Quote
+              </button>
+            </div>
+
+            <div style={{ position: "absolute", inset: 0, paddingTop: 56 }}>
+              <GhostStage talking={talking} intensity={talkIntensity} />
+            </div>
+
+            <div style={{ position: "absolute", bottom: 12, left: 14, opacity: 0.7, fontSize: 12 }}>
+              Model loaded from <code>/public/Ghost.glb</code>
+            </div>
+          </div>
+
+          {/* CHAT LOG */}
+          <div
             style={{
               borderRadius: 18,
-              background: "rgba(0,0,0,0.35)",
-              border: "1px solid rgba(255,255,255,0.08)",
+              border: "1px solid rgba(255,255,255,0.10)",
+              background: "rgba(10,10,14,0.70)",
               padding: 14,
-              marginBottom: 10,
+              height: 420,
+              overflow: "auto",
+            }}
+          >
+            {messages.map((m) => (
+              <div
+                key={m.id}
+                style={{
+                  display: "flex",
+                  justifyContent: m.speaker === "You" ? "flex-end" : "flex-start",
+                  marginBottom: 12,
+                }}
+              >
+                <div
+                  style={{
+                    maxWidth: "86%",
+                    padding: "12px 14px",
+                    borderRadius: 16,
+                    background: m.speaker === "You" ? "white" : "rgba(255,255,255,0.08)",
+                    color: m.speaker === "You" ? "#000" : "rgba(255,255,255,0.92)",
+                    border: m.speaker === "You" ? "none" : "1px solid rgba(255,255,255,0.10)",
+                  }}
+                >
+                  <div style={{ opacity: 0.65, fontSize: 11, marginBottom: 6, display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <span style={{ fontWeight: 800 }}>{m.speaker}</span>
+                    <span>{m.time}</span>
+                  </div>
+                  <div style={{ fontSize: 14, lineHeight: "22px" }}>{m.text}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* INPUT */}
+          <div
+            style={{
+              borderRadius: 18,
+              border: "1px solid rgba(255,255,255,0.10)",
+              background: "rgba(10,10,14,0.70)",
+              padding: 12,
               display: "flex",
-              justifyContent: "space-between",
-              gap: 12,
+              gap: 10,
               alignItems: "center",
             }}
           >
-            <div>
-              <div style={{ fontWeight: 900 }}>{a.name}</div>
-              <div style={{ fontSize: 12, opacity: 0.7 }}>{a.text}</div>
-            </div>
-            <div style={{ fontSize: 12, padding: "4px 10px", borderRadius: 999, border: "1px solid rgba(255,255,255,0.10)", opacity: 0.85 }}>
-              {a.status}
-            </div>
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder='Try: "Botox leads Austin" or "quote"'
+              style={{
+                flex: 1,
+                background: "rgba(0,0,0,0.25)",
+                border: "1px solid rgba(255,255,255,0.10)",
+                borderRadius: 14,
+                padding: "12px 12px",
+                color: "white",
+                outline: "none",
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") onSend();
+              }}
+            />
+            <button onClick={onSend} style={sendBtn}>
+              Send
+            </button>
           </div>
-        ))}
-        <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7, lineHeight: 1.45 }}>
-          <b>To make him “real”:</b>
-          <div>1) Export a rigged GLB/VRM with facial blendshapes (visemes).</div>
-          <div>2) Put it at <b>/public/ghost.glb</b></div>
-          <div>3) Refresh. The stage becomes true 3D + mouth movement.</div>
+        </div>
+
+        {/* RIGHT TEAM */}
+        <div
+          style={{
+            borderRadius: 18,
+            border: "1px solid rgba(255,255,255,0.10)",
+            background: "rgba(10,10,14,0.70)",
+            padding: 16,
+            height: "calc(100vh - 36px)",
+            position: "sticky",
+            top: 18,
+          }}
+        >
+          <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 12 }}>Team</div>
+
+          {[
+            ["Lead Gen", "Find & qualify med spa targets"],
+            ["Outreach", "DM/SMS/Email scripts + follow-ups"],
+            ["Ops", "Task routing + checklists"],
+            ["Research", "Offers, pricing, competitors"],
+            ["Automation", "Connect tools + reduce manual work"],
+          ].map(([title, desc]) => (
+            <div
+              key={title}
+              style={{
+                borderRadius: 16,
+                border: "1px solid rgba(255,255,255,0.10)",
+                background: "rgba(0,0,0,0.22)",
+                padding: 12,
+                marginBottom: 10,
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                <div style={{ fontWeight: 800 }}>{title}</div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Idle</div>
+              </div>
+              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>{desc}</div>
+            </div>
+          ))}
+
+          <div style={{ marginTop: 14, fontSize: 12, opacity: 0.75 }}>
+            Tip: Keep your model file named exactly <code>Ghost.glb</code> inside <code>/public</code>.
+          </div>
         </div>
       </div>
-
-      {!mounted.current ? null : null}
     </div>
   );
 }
 
-/** Suspense-like wrapper without React.Suspense to avoid edge cases in some builds */
-function SuspenseGLB({
-  speakingIntensity,
-  lookAt,
-  onModelInfo,
-}: {
-  speakingIntensity: number;
-  lookAt: THREE.Vector3;
-  onModelInfo: (ok: boolean, morphs: boolean) => void;
-}) {
-  const [ok, setOk] = useState(true);
+const pillBtn: React.CSSProperties = {
+  padding: "10px 12px",
+  borderRadius: 14,
+  border: "1px solid rgba(255,255,255,0.12)",
+  background: "rgba(0,0,0,0.22)",
+  color: "rgba(255,255,255,0.92)",
+  cursor: "pointer",
+  fontWeight: 800,
+};
 
-  // If GLB fails, Drei throws; we guard by try/catch in effect-ish pattern using a fallback boundary approach:
-  // For simplicity: if this component ever errors, user will see 2D fallback on next render (handled by parent state),
-  // but Next/React error boundaries aren't in this snippet. In practice, if you don't have ghost.glb, set hasGLB=false.
+const sendBtn: React.CSSProperties = {
+  padding: "12px 16px",
+  borderRadius: 14,
+  border: "1px solid rgba(140,80,255,0.35)",
+  background: "linear-gradient(135deg, rgba(140,80,255,0.9), rgba(180,80,255,0.75))",
+  color: "white",
+  cursor: "pointer",
+  fontWeight: 900,
+};
 
-  useEffect(() => {
-    // If you don't upload ghost.glb, just switch to 2D fallback:
-    // onModelInfo(false, false)
-  }, [onModelInfo]);
-
-  if (!ok) return null;
-
-  try {
-    return (
-      <GhostModel
-        speakingIntensity={speakingIntensity}
-        lookAt={lookAt}
-        onLoaded={(morphs) => onModelInfo(true, morphs)}
-      />
-    );
-  } catch {
-    onModelInfo(false, false);
-    return null;
-  }
+function navBtnStyle(active: boolean): React.CSSProperties {
+  return {
+    padding: "12px 12px",
+    borderRadius: 14,
+    border: active ? "1px solid rgba(255,255,255,0.18)" : "1px solid rgba(255,255,255,0.10)",
+    background: active ? "rgba(255,255,255,0.92)" : "rgba(0,0,0,0.22)",
+    color: active ? "#000" : "rgba(255,255,255,0.9)",
+    fontWeight: 800,
+    cursor: "pointer",
+  };
 }
 
-useGLTF.preload("/ghost.glb");
+// Needed for drei GLTF loader types
+useGLTF.preload("/Ghost.glb");
