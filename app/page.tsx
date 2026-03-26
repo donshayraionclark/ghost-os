@@ -13,14 +13,11 @@ import * as THREE from "three";
 
 /**
  * GHOST OS — Full-body 3D Ghost + ALIVE + voice + typewriter bubble
+ * + ON-SCREEN morph target detector (so you don't need DevTools)
  *
- * REQUIREMENTS (you already have most):
- * 1) public/Ghost.glb  (your Meshy full-body)
+ * REQUIREMENTS:
+ * 1) public/Ghost.glb
  * 2) npm i three @react-three/fiber @react-three/drei
- *
- * Notes:
- * - Real mouth animation requires morph targets (blendshapes) OR a jaw bone.
- * - This file tries morph targets first; if none exist, it uses jaw/head motion fallback.
  */
 
 type Msg = {
@@ -56,18 +53,19 @@ function speakWithBrowserVoice(text: string) {
     const synth = window.speechSynthesis;
     if (!synth) return { stop: () => {} };
 
-    // Stop anything already speaking
     synth.cancel();
 
     const u = new SpeechSynthesisUtterance(text);
-    u.rate = 0.98; // slightly slower, more “operator”
+    u.rate = 0.98;
     u.pitch = 0.85;
     u.volume = 1;
 
-    // Pick a voice (best effort)
     const voices = synth.getVoices?.() || [];
     const preferred =
-      voices.find((v) => /en-US/i.test(v.lang) && /male|daniel|alex|david|fred/i.test(v.name)) ||
+      voices.find(
+        (v) =>
+          /en-US/i.test(v.lang) && /male|daniel|alex|david|fred/i.test(v.name)
+      ) ||
       voices.find((v) => /en-US/i.test(v.lang)) ||
       voices[0];
 
@@ -87,16 +85,13 @@ function speakWithBrowserVoice(text: string) {
 /** ---------- MORPH TARGET DISCOVERY + DRIVER ---------- */
 type MorphHandle = {
   meshes: THREE.Mesh[];
-  dicts: Record<string, number>[];
   influences: number[][];
   hasMorphs: boolean;
-  // best guess indices for mouth open / visemes
   idxMouthOpen: number[];
 };
 
 function findMorphTargets(root: THREE.Object3D): MorphHandle {
   const meshes: THREE.Mesh[] = [];
-  const dicts: Record<string, number>[] = [];
   const influences: number[][] = [];
   const idxMouthOpen: number[] = [];
 
@@ -106,13 +101,13 @@ function findMorphTargets(root: THREE.Object3D): MorphHandle {
     if (!m.morphTargetDictionary || !m.morphTargetInfluences) return;
 
     meshes.push(m);
-    dicts.push(m.morphTargetDictionary);
     influences.push(m.morphTargetInfluences);
 
-    // Try to find a “mouth open” style blendshape by name
     const keys = Object.keys(m.morphTargetDictionary);
+
     const pick =
-      keys.find((k) => /mouthopen|jawopen|openmouth|aa|viseme_aa/i.test(k)) ??
+      keys.find((k) => /mouthopen|jawopen|openmouth/i.test(k)) ??
+      keys.find((k) => /viseme_aa|aa\b|A\b/i.test(k)) ??
       keys.find((k) => /viseme|mouth|jaw/i.test(k));
 
     if (pick) idxMouthOpen.push(m.morphTargetDictionary[pick]);
@@ -121,7 +116,6 @@ function findMorphTargets(root: THREE.Object3D): MorphHandle {
 
   return {
     meshes,
-    dicts,
     influences,
     hasMorphs: meshes.length > 0,
     idxMouthOpen,
@@ -148,25 +142,28 @@ function GhostModel({
   bubbleVisible,
 }: {
   talking: boolean;
-  intensity: number; // 0..1
-  hoverBoost: number; // 0..1
-  clickBurst: number; // 0..1
+  intensity: number;
+  hoverBoost: number;
+  clickBurst: number;
   bubbleText: string;
   bubbleVisible: boolean;
 }) {
-  // Cache bust every minute to refresh local changes when you swap Ghost.glb
+  // Cache bust every minute so swaps to Ghost.glb show up quickly.
   const url = useMemo(() => `/Ghost.glb?v=${Math.floor(Date.now() / 60000)}`, []);
   const gltf = useGLTF(url);
 
   const group = useRef<THREE.Group>(null);
-  const root = useRef<THREE.Object3D | null>(null);
 
   const mhRef = useRef<MorphHandle | null>(null);
+  const targetRotY = useRef(0);
+  const targetRotX = useRef(0);
 
-  // Find morph targets once
+  // ON-SCREEN morph target report (no DevTools needed)
+  const [morphReport, setMorphReport] = useState<string>(
+    "Scanning morph targets..."
+  );
+
   useEffect(() => {
-    root.current = gltf.scene;
-
     // Improve shading a bit
     gltf.scene.traverse((o) => {
       const m = o as THREE.Mesh;
@@ -178,35 +175,47 @@ function GhostModel({
     });
 
     mhRef.current = findMorphTargets(gltf.scene);
-    // You can look in browser console if you want:
-    // console.log("MORPH TARGETS:", mhRef.current);
-  }, [gltf]);
 
-  // Mouse interaction target
-  const targetRotY = useRef(0);
-  const targetRotX = useRef(0);
+    // Build readable report
+    const names = new Set<string>();
+    gltf.scene.traverse((o: any) => {
+      if (o?.morphTargetDictionary) {
+        Object.keys(o.morphTargetDictionary).forEach((k) => names.add(k));
+      }
+    });
+
+    setMorphReport(
+      names.size
+        ? `✅ Morph targets found (${names.size}): ${Array.from(names)
+            .slice(0, 18)
+            .join(", ")}${names.size > 18 ? "…" : ""}`
+        : "❌ No morph targets found in this GLB (we’ll use jaw/head talking motion instead)."
+    );
+  }, [gltf]);
 
   useFrame((state) => {
     if (!group.current) return;
 
     const t = state.clock.getElapsedTime();
-    const alive = 1 + 0.015 * Math.sin(t * 1.2); // breathing
+
+    // Alive / breathing
+    const alive = 1 + 0.015 * Math.sin(t * 1.2);
     const idleBob = 0.045 * Math.sin(t * 1.35);
     const idleSway = 0.10 * Math.sin(t * 0.55);
 
     // Talking motion
-    const talkBob = (talking ? 0.08 * Math.sin(t * 7.5) * intensity : 0);
-    const talkNod = (talking ? 0.16 * Math.sin(t * 9.0) * intensity : 0);
-    const talkTwist = (talking ? 0.12 * Math.sin(t * 6.2) * intensity : 0);
+    const talkBob = talking ? 0.08 * Math.sin(t * 7.5) * intensity : 0;
+    const talkNod = talking ? 0.16 * Math.sin(t * 9.0) * intensity : 0;
+    const talkTwist = talking ? 0.12 * Math.sin(t * 6.2) * intensity : 0;
 
-    // Hover reaction (subtle)
+    // Hover reaction
     const hoverWobble = 0.10 * hoverBoost * Math.sin(t * 3.0);
 
-    // Click burst (short, strong “I’m listening” move)
+    // Click burst
     const burst = clickBurst;
 
-    // Position + rotation
     group.current.position.y = idleBob + talkBob;
+
     group.current.rotation.y =
       idleSway +
       talkTwist +
@@ -219,44 +228,45 @@ function GhostModel({
       THREE.MathUtils.lerp(group.current.rotation.x, targetRotX.current, 0.05) -
       burst * 0.06;
 
-    // BIG SIZE (3x)
-    const baseScale = 3.15; // <= increase/decrease here
+    // BIG size
+    const baseScale = 3.15; // increase if you want even bigger
     const pulse = talking
       ? 1 + 0.02 * Math.sin(t * 10.0) * intensity
       : 1 + 0.01 * Math.sin(t * 2.0);
-    group.current.scale.setScalar(baseScale * alive * pulse * (1 + burst * 0.03));
 
-    // Mouth animation: morph targets if available; otherwise implied movement
+    group.current.scale.setScalar(
+      baseScale * alive * pulse * (1 + burst * 0.03)
+    );
+
+    // Mouth animation if morph targets exist
     const mh = mhRef.current;
     if (mh?.hasMorphs) {
-      // “fake” viseme oscillator while talking
-      const mouth = talking ? clamp(0.15 + 0.85 * Math.abs(Math.sin(t * 12.0)) * intensity, 0, 1) : 0;
+      const mouth = talking
+        ? clamp(0.15 + 0.85 * Math.abs(Math.sin(t * 12.0)) * intensity, 0, 1)
+        : 0;
       setMouthOpen(mh, mouth);
     }
   });
 
-  // Pointer tracking for “alive” reactions
   const onPointerMove = (e: any) => {
-    // e.uv is not always present; use movement in screen space
     if (!group.current) return;
-    // Convert pointer to a small head turn target
-    const px = (e.pointer?.x ?? 0) / window.innerWidth; // 0..1
-    const py = (e.pointer?.y ?? 0) / window.innerHeight; // 0..1
+    const px = (e.pointer?.x ?? 0) / window.innerWidth;
+    const py = (e.pointer?.y ?? 0) / window.innerHeight;
     const nx = (px - 0.5) * 2;
     const ny = (py - 0.5) * 2;
 
     targetRotY.current = clamp(nx * 0.25, -0.35, 0.35);
-    targetRotX.current = clamp(-ny * 0.12, -0.20, 0.20);
+    targetRotX.current = clamp(-ny * 0.12, -0.2, 0.2);
   };
 
   return (
     <group ref={group} onPointerMove={onPointerMove}>
-      {/* Speech bubble attached in 3D space (near head) */}
+      {/* Speech bubble anchored near head */}
       <Html
-        position={[0, 1.65, 0.55]} // move bubble higher/lower relative to model
+        position={[0, 1.65, 0.55]}
         center
         transform
-        distanceFactor={1.25} // keep bubble proportional
+        distanceFactor={1.25}
         style={{
           pointerEvents: "none",
           opacity: bubbleVisible ? 1 : 0,
@@ -283,6 +293,24 @@ function GhostModel({
         </div>
       </Html>
 
+      {/* Morph target detector panel (on-screen) */}
+      <Html position={[0, 2.25, 0]} center transform distanceFactor={1.6}>
+        <div
+          style={{
+            padding: "10px 12px",
+            borderRadius: 14,
+            background: "rgba(0,0,0,0.55)",
+            border: "1px solid rgba(255,255,255,0.10)",
+            color: "white",
+            fontSize: 12,
+            maxWidth: 520,
+            lineHeight: "18px",
+          }}
+        >
+          {morphReport}
+        </div>
+      </Html>
+
       <primitive object={gltf.scene} />
     </group>
   );
@@ -300,7 +328,6 @@ function GhostStage(props: React.ComponentProps<typeof GhostModel>) {
           "radial-gradient(1200px 700px at 50% 15%, rgba(140,80,255,0.22), rgba(0,0,0,0))",
       }}
     >
-      {/* Lights */}
       <ambientLight intensity={0.55} />
       <directionalLight position={[3, 5, 2]} intensity={1.35} />
       <pointLight position={[-2, 2, 2]} intensity={0.75} />
@@ -311,7 +338,6 @@ function GhostStage(props: React.ComponentProps<typeof GhostModel>) {
         <GhostModel {...props} />
       </Suspense>
 
-      {/* Ground shadow makes him feel “real” */}
       <ContactShadows
         position={[0, -0.95, 0]}
         opacity={0.55}
@@ -320,7 +346,6 @@ function GhostStage(props: React.ComponentProps<typeof GhostModel>) {
         far={6}
       />
 
-      {/* Orbit (interactive) */}
       <OrbitControls
         enablePan={false}
         minDistance={2.1}
@@ -335,12 +360,15 @@ function GhostStage(props: React.ComponentProps<typeof GhostModel>) {
 /** ---------- MAIN PAGE ---------- */
 export default function Page() {
   const [messages, setMessages] = useState<Msg[]>([
-    { id: 1, speaker: "Ghost", text: "I’m online. Give me the objective. I’ll run the team.", time: nowTime() },
+    {
+      id: 1,
+      speaker: "Ghost",
+      text: "I’m online. Give me the objective. I’ll run the team.",
+      time: nowTime(),
+    },
   ]);
-
   const [input, setInput] = useState("");
 
-  // Talking/bubble system
   const [bubbleText, setBubbleText] = useState("");
   const [bubbleVisible, setBubbleVisible] = useState(false);
 
@@ -353,7 +381,7 @@ export default function Page() {
   const typingRef = useRef(false);
   const voiceStopRef = useRef<null | (() => void)>(null);
 
-  // Smooth hover/click state
+  // Smooth hover/click decay
   useEffect(() => {
     let raf = 0;
     const loop = () => {
@@ -369,7 +397,6 @@ export default function Page() {
     if (typingRef.current) return;
     typingRef.current = true;
 
-    // stop any current voice
     if (voiceStopRef.current) voiceStopRef.current();
     voiceStopRef.current = null;
 
@@ -377,34 +404,27 @@ export default function Page() {
     setBubbleVisible(true);
     setBubbleText("");
 
-    // ramp intensity up quickly
     setTalkIntensity(0.35);
     await wait(120);
     setTalkIntensity(0.85);
 
-    // Start voice immediately (so it feels “alive”)
     const voice = speakWithBrowserVoice(text);
     if (voice?.stop) voiceStopRef.current = voice.stop;
 
-    // Typewriter effect
     for (let i = 1; i <= text.length; i++) {
       setBubbleText(text.slice(0, i));
       await wait(14);
     }
 
-    // Hold briefly
     await wait(650);
 
-    // Fade out bubble while still “talking”
     setBubbleVisible(false);
 
-    // Ramp down
     setTalkIntensity(0.25);
     await wait(220);
     setTalkIntensity(0);
     setTalking(false);
 
-    // Clear after fade
     await wait(420);
     setBubbleText("");
 
@@ -412,12 +432,18 @@ export default function Page() {
   }
 
   async function addGhost(text: string) {
-    setMessages((prev) => [...prev, { id: Date.now(), speaker: "Ghost", text, time: nowTime() }]);
+    setMessages((prev) => [
+      ...prev,
+      { id: Date.now(), speaker: "Ghost", text, time: nowTime() },
+    ]);
     await typeAndSpeak(text);
   }
 
   function addUser(text: string) {
-    setMessages((prev) => [...prev, { id: Date.now(), speaker: "You", text, time: nowTime() }]);
+    setMessages((prev) => [
+      ...prev,
+      { id: Date.now(), speaker: "You", text, time: nowTime() },
+    ]);
   }
 
   async function onSend() {
@@ -443,7 +469,7 @@ export default function Page() {
     await addGhost("Say the objective in one line. City + offer + what you want done next.");
   }
 
-  // Keep him ALIVE: drop a quote periodically (only if not currently speaking)
+  // Random “alive” quote every ~28s
   useEffect(() => {
     const id = setInterval(() => {
       if (typingRef.current) return;
@@ -454,17 +480,12 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const heat = Math.round(clamp(45 + talkIntensity * 45 + hoverBoost * 10 + clickBurst * 20, 0, 100));
+  const heat = Math.round(
+    clamp(45 + talkIntensity * 45 + hoverBoost * 10 + clickBurst * 20, 0, 100)
+  );
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "#07070a",
-        color: "white",
-        padding: 18,
-      }}
-    >
+    <div style={{ minHeight: "100vh", background: "#07070a", color: "white", padding: 18 }}>
       <div
         style={{
           maxWidth: 1480,
@@ -479,7 +500,7 @@ export default function Page() {
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
             <div style={logoBox}>G</div>
             <div>
-              <div style={{ fontWeight: 900, fontSize: 18 }}>Ghost OS</div>
+              <div style={{ fontWeight: 950, fontSize: 18 }}>Ghost OS</div>
               <div style={{ opacity: 0.65, fontSize: 12 }}>COO Agent Interface</div>
             </div>
           </div>
@@ -491,8 +512,8 @@ export default function Page() {
           </div>
 
           <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.10)" }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <div style={{ opacity: 0.8, fontWeight: 800 }}>HEAT</div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div style={{ opacity: 0.8, fontWeight: 900 }}>HEAT</div>
               <div style={{ opacity: 0.8 }}>{heat}/100</div>
             </div>
 
@@ -507,11 +528,12 @@ export default function Page() {
               />
             </div>
 
-            <div style={{ marginTop: 14, fontSize: 12, opacity: 0.75, lineHeight: "18px" }}>
-              Tips:
-              <br />• Your model loads from <code>/public/Ghost.glb</code>
-              <br />• Type <b>quote</b> or <b>botox leads Austin</b>
-              <br />• Hover = reaction, Click stage = “lock-in” burst
+            <div style={{ marginTop: 14, fontSize: 12, opacity: 0.78, lineHeight: "18px" }}>
+              <b>Model file:</b> <code>/public/Ghost.glb</code>
+              <br />
+              <b>Try:</b> <code>quote</code> or <code>botox leads Austin</code>
+              <br />
+              Hover = reacts • Click stage = lock-in burst
             </div>
           </div>
         </aside>
@@ -522,7 +544,7 @@ export default function Page() {
           <section
             style={{
               position: "relative",
-              height: 520, // bigger stage
+              height: 520,
               borderRadius: 18,
               border: "1px solid rgba(255,255,255,0.10)",
               background: "rgba(10,10,14,0.55)",
@@ -534,7 +556,7 @@ export default function Page() {
             onClick={() => setClickBurst(1)}
           >
             <div style={{ position: "absolute", left: 14, top: 12, zIndex: 5 }}>
-              <div style={{ fontWeight: 950, fontSize: 22 }}>Ghost (COO)</div>
+              <div style={{ fontWeight: 980, fontSize: 22 }}>Ghost (COO)</div>
               <div style={{ opacity: 0.7, fontSize: 12 }}>
                 Live: 3D + voice + typewriter + reactive motion
               </div>
@@ -595,7 +617,7 @@ export default function Page() {
                       gap: 10,
                     }}
                   >
-                    <span style={{ fontWeight: 900 }}>{m.speaker}</span>
+                    <span style={{ fontWeight: 950 }}>{m.speaker}</span>
                     <span>{m.time}</span>
                   </div>
                   <div style={{ fontSize: 14, lineHeight: "22px" }}>{m.text}</div>
@@ -623,7 +645,7 @@ export default function Page() {
 
         {/* RIGHT */}
         <aside style={panelSticky}>
-          <div style={{ fontWeight: 950, fontSize: 18, marginBottom: 12 }}>Team</div>
+          <div style={{ fontWeight: 980, fontSize: 18, marginBottom: 12 }}>Team</div>
 
           {[
             ["Lead Gen", "Find & qualify med spa targets"],
@@ -634,7 +656,7 @@ export default function Page() {
           ].map(([title, desc]) => (
             <div key={title} style={card}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                <div style={{ fontWeight: 900 }}>{title}</div>
+                <div style={{ fontWeight: 950 }}>{title}</div>
                 <div style={{ fontSize: 12, opacity: 0.8 }}>Idle</div>
               </div>
               <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>{desc}</div>
@@ -642,9 +664,9 @@ export default function Page() {
           ))}
 
           <div style={{ marginTop: 14, fontSize: 12, opacity: 0.78, lineHeight: "18px" }}>
-            <b>File rule:</b> keep your model named exactly <code>Ghost.glb</code> in <code>/public</code>.
+            Keep your model file named exactly <code>Ghost.glb</code> inside <code>/public</code>.
             <br />
-            If you swap the GLB locally, refresh the page (this code cache-busts every minute).
+            Refresh after swapping the file.
           </div>
         </aside>
       </div>
@@ -674,7 +696,7 @@ const logoBox: React.CSSProperties = {
   background: "rgba(255,255,255,0.10)",
   display: "grid",
   placeItems: "center",
-  fontWeight: 900,
+  fontWeight: 950,
 };
 
 const pillBtn: React.CSSProperties = {
@@ -684,7 +706,7 @@ const pillBtn: React.CSSProperties = {
   background: "rgba(0,0,0,0.22)",
   color: "rgba(255,255,255,0.92)",
   cursor: "pointer",
-  fontWeight: 900,
+  fontWeight: 950,
 };
 
 const sendBtn: React.CSSProperties = {
@@ -694,7 +716,7 @@ const sendBtn: React.CSSProperties = {
   background: "linear-gradient(135deg, rgba(140,80,255,0.95), rgba(255,80,140,0.85))",
   color: "white",
   cursor: "pointer",
-  fontWeight: 950,
+  fontWeight: 980,
 };
 
 const inputStyle: React.CSSProperties = {
@@ -719,10 +741,12 @@ function navBtn(active: boolean): React.CSSProperties {
   return {
     padding: "12px 12px",
     borderRadius: 14,
-    border: active ? "1px solid rgba(255,255,255,0.18)" : "1px solid rgba(255,255,255,0.10)",
+    border: active
+      ? "1px solid rgba(255,255,255,0.18)"
+      : "1px solid rgba(255,255,255,0.10)",
     background: active ? "rgba(255,255,255,0.92)" : "rgba(0,0,0,0.22)",
     color: active ? "#000" : "rgba(255,255,255,0.9)",
-    fontWeight: 900,
+    fontWeight: 980,
     cursor: "pointer",
   };
 }
