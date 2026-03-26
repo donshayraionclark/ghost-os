@@ -1,6 +1,6 @@
 export const metadata = {
   title: "Ghost OS",
-  description: "Ghost OS — Interactive COO Agent UI",
+  description: "COO Agent Interface",
 };
 
 export default function RootLayout({
@@ -10,7 +10,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body style={{ margin: 0, background: "#0b0b0f", color: "#fff" }}>
+      <body style={{ margin: 0, background: "#07070a", color: "white" }}>
         {children}
       </body>
     </html>
