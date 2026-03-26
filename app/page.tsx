@@ -249,21 +249,19 @@ export default function Page() {
             marginBottom: 14,
           }}
         >
-          <div
-            style={{
-              width: 56,
-              height: 56,
-              borderRadius: 18,
-              background: "rgba(255,255,255,0.10)",
-              display: "grid",
-              placeItems: "center",
-              fontWeight: 900,
-              fontSize: 18,
-            }}
-            title="Replace this with your custom character art later (SVG/PNG)"
-          >
-            👤
-          </div>
+          <img
+  src="/Ghost2.png"
+  alt="Ghost"
+  title="Ghost (COO)"
+  style={{
+    width: 56,
+    height: 56,
+    borderRadius: 18,
+    objectFit: "cover",
+    border: "1px solid rgba(255,255,255,0.12)",
+    background: "rgba(255,255,255,0.06)",
+  }}
+/>
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 900, fontSize: 16, letterSpacing: 0.2 }}>Ghost (COO)</div>
             <div style={{ opacity: 0.75, fontSize: 13 }}>
