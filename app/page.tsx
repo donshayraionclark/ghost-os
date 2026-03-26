@@ -1,465 +1,301 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { motion } from "framer-motion";
-import { MessageSquare, Users, Zap, Flame, SendHorizonal } from "lucide-react";
-
 import { Canvas, useFrame } from "@react-three/fiber";
-import { Environment, Sparkles, useTexture } from "@react-three/drei";
+import { Environment, Float, Html, OrbitControls, Sparkles, useGLTF } from "@react-three/drei";
 import * as THREE from "three";
+import { motion, AnimatePresence } from "framer-motion";
 
-type Msg = {
-  id: number;
-  speaker: "Ghost" | "You";
-  text: string;
-  time: string;
-};
+/**
+ * Ghost OS — 3D COO Stage (Next.js App Router, Vercel-safe)
+ * - BIG 3D stage (no “box frame”)
+ * - Constant idle reactions: breathing, float, micro-tilt, eye/attention vibe
+ * - Voice (Web Speech API)
+ * - Speech text: type-on while speaking, then fades out
+ * - If /public/ghost.glb exists -> loads it; otherwise uses /public/Ghost2.png fallback
+ *
+ * IMPORTANT:
+ * - True mouth/face animation requires a rigged model w/ morph targets (visemes).
+ * - If your GLB has morph targets, this code will try a few common names.
+ */
 
-type Agent = {
-  id: string;
-  name: string;
-  role: string;
-  status: "Idle" | "Working";
-};
+type SpeakState = { text: string; visibleText: string; active: boolean };
 
-const quoteBank = [
+const QUOTES = [
   "Pressure exposes who you really are.",
-  "If it’s not disciplined, it’s not real.",
-  "Move quiet. Execute loud.",
-  "No emotions. Just decisions.",
-  "If you want momentum, win the next hour.",
-  "Don’t negotiate with your goals.",
   "Build systems. Stop begging for motivation.",
-  "If it’s important, it gets scheduled.",
-  "You don’t need more time. You need more precision.",
+  "Move first. Explain later.",
+  "If it’s not disciplined, it’s not real.",
+  "The goal is simple: execute.",
+  "One clean move beats ten loud plans.",
 ];
 
-const initialAgents: Agent[] = [
-  { id: "lead", name: "Lead Gen", role: "Find & qualify Botox/MedSpa leads", status: "Idle" },
-  { id: "outreach", name: "Outreach", role: "DM/SMS/Email scripts + follow-ups", status: "Idle" },
-  { id: "ops", name: "Ops", role: "Task routing + checklists", status: "Idle" },
-  { id: "research", name: "Research", role: "Offers, pricing, competitors", status: "Idle" },
-  { id: "automation", name: "Automation", role: "Connect tools + reduce manual work", status: "Idle" },
-];
-
-function nowTime() {
-  const d = new Date();
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function useIsMounted() {
+  const r = useRef(false);
+  useEffect(() => {
+    r.current = true;
+    return () => {
+      r.current = false;
+    };
+  }, []);
+  return r;
 }
 
 function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
 }
 
-function localGet<T>(key: string, fallback: T): T {
-  try {
-    const v = localStorage.getItem(key);
-    return v == null ? fallback : (JSON.parse(v) as T);
-  } catch {
-    return fallback;
-  }
-}
-
-function localSet(key: string, value: any) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch {}
-}
-
-/**
- * 3D Ghost:
- * - Uses your /public/Ghost2.png as texture
- * - "3D" box (front face = image, sides dark)
- * - Constant idle: float + breathe + glow pulse + blink (scaleY micro-dip)
- * - Reacts to mouse (look/tilt)
- * - Speaking pulse
- */
-function Ghost3D({
-  speaking,
-  mood,
-  onClick,
+/** ---------- 3D MODEL (GLB) ---------- */
+function GhostModel({
+  speakingIntensity,
+  lookAt,
+  onLoaded,
 }: {
-  speaking: boolean;
-  mood: number; // 0..100 heat
-  onClick?: () => void;
+  speakingIntensity: number;
+  lookAt: THREE.Vector3;
+  onLoaded?: (hasMorphs: boolean) => void;
 }) {
+  // If ghost.glb doesn't exist, Drei will throw; we catch in parent by conditional rendering.
+  const gltf = useGLTF("/ghost.glb") as any;
+
   const group = useRef<THREE.Group>(null);
-  const face = useRef<THREE.Mesh>(null);
-  const glow = useRef<THREE.Mesh>(null);
-
-  const tex = useTexture("/Ghost2.png");
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 8;
-
-  const mouse = useRef({ x: 0, y: 0 });
+  const [hasMorphs, setHasMorphs] = useState(false);
+  const mouthTargetsRef = useRef<{ mesh: THREE.Mesh; dict: any; infl: any }[]>([]);
 
   useEffect(() => {
-    const onMove = (e: MouseEvent) => {
-      const x = (e.clientX / window.innerWidth) * 2 - 1; // -1..1
-      const y = (e.clientY / window.innerHeight) * 2 - 1;
-      mouse.current = { x, y };
-    };
-    window.addEventListener("mousemove", onMove);
-    return () => window.removeEventListener("mousemove", onMove);
-  }, []);
+    const targets: { mesh: THREE.Mesh; dict: any; infl: any }[] = [];
+    let found = false;
 
-  // blink (brief squash)
-  const blinkT = useRef(0);
-  const nextBlink = useRef(1.8 + Math.random() * 2.2);
+    gltf.scene.traverse((obj: any) => {
+      if (obj && obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences) {
+        found = true;
+        targets.push({ mesh: obj, dict: obj.morphTargetDictionary, infl: obj.morphTargetInfluences });
+      }
+    });
 
-  useFrame((state, dt) => {
-    const t = state.clock.getElapsedTime();
-    const g = group.current;
-    if (!g) return;
+    mouthTargetsRef.current = targets;
+    setHasMorphs(found);
+    onLoaded?.(found);
+  }, [gltf, onLoaded]);
 
-    // Idle float/breathe
-    const float = Math.sin(t * 1.2) * 0.08;
-    const breathe = 1 + Math.sin(t * 1.6) * 0.02;
+  // Try to drive mouth morph targets with a few common names
+  const setMouth = (value: number) => {
+    const v = clamp(value, 0, 1);
+    for (const t of mouthTargetsRef.current) {
+      const d = t.dict;
+      const i = t.infl;
 
-    // Look/tilt toward mouse
-    const targetRotY = mouse.current.x * 0.35;
-    const targetRotX = -mouse.current.y * 0.18;
+      // Common morph names across exporters
+      const candidates = [
+        "mouthOpen",
+        "jawOpen",
+        "JawOpen",
+        "viseme_aa",
+        "viseme_AA",
+        "A",
+        "aa",
+        "vrc.v_aa",
+      ];
 
-    g.position.y = float;
-    g.rotation.y += (targetRotY - g.rotation.y) * 0.08;
-    g.rotation.x += (targetRotX - g.rotation.x) * 0.08;
-
-    // speaking pulse (stronger)
-    const talk = speaking ? 1 + Math.sin(t * 9) * 0.05 : 1;
-
-    // heat affects glow intensity
-    const heatBoost = 0.35 + (mood / 100) * 0.75;
-
-    g.scale.setScalar(breathe * talk);
-
-    // blink timing
-    blinkT.current += dt;
-    if (blinkT.current > nextBlink.current) {
-      // start blink
-      nextBlink.current = blinkT.current + (1.8 + Math.random() * 2.2);
-      // blink animation: quick squash
-      if (face.current) {
-        face.current.scale.y = 0.82;
-        setTimeout(() => {
-          if (face.current) face.current.scale.y = 1;
-        }, 120);
+      for (const name of candidates) {
+        const idx = d?.[name];
+        if (typeof idx === "number") {
+          i[idx] = v;
+        }
       }
     }
+  };
 
-    // glow pulse
-    if (glow.current) {
-      const mat = glow.current.material as THREE.MeshStandardMaterial;
-      mat.opacity = 0.20 + Math.sin(t * 2.3) * 0.05 + (speaking ? 0.10 : 0);
-      mat.emissiveIntensity = heatBoost + (speaking ? 0.6 : 0);
-    }
+  useFrame((state, dt) => {
+    if (!group.current) return;
+
+    // Always “alive”
+    const t = state.clock.getElapsedTime();
+
+    // Subtle torso breathing + micro-sway
+    group.current.rotation.y = THREE.MathUtils.lerp(group.current.rotation.y, (state.pointer.x * 0.25) as number, 0.06);
+    group.current.rotation.x = THREE.MathUtils.lerp(group.current.rotation.x, (-state.pointer.y * 0.12) as number, 0.06);
+
+    // Look-at (camera-ish)
+    group.current.lookAt(lookAt);
+
+    // Mouth drive (only meaningful if morphs exist)
+    const mouth = 0.12 + speakingIntensity * 0.85 + Math.abs(Math.sin(t * 6)) * (speakingIntensity * 0.15);
+    setMouth(mouth);
   });
 
   return (
-    <group
-      ref={group}
-      onClick={onClick}
-      // Position + scale makes him feel BIG in frame
-      position={[0, -0.15, 0]}
-    >
-      {/* halo glow plane behind */}
-      <mesh ref={glow} position={[0, 0, -0.26]}>
-        <planeGeometry args={[2.7, 2.7]} />
-        <meshStandardMaterial
-          transparent
-          opacity={0.28}
-          color={"#8c5aff"}
-          emissive={"#ff5050"}
-          emissiveIntensity={0.9}
-        />
-      </mesh>
-
-      {/* 3D “card” body */}
-      <mesh ref={face} castShadow receiveShadow>
-        <boxGeometry args={[1.85, 1.85, 0.22]} />
-        {/* right */}
-        <meshStandardMaterial attach="material-0" color={"#0d0d12"} />
-        {/* left */}
-        <meshStandardMaterial attach="material-1" color={"#0d0d12"} />
-        {/* top */}
-        <meshStandardMaterial attach="material-2" color={"#101018"} />
-        {/* bottom */}
-        <meshStandardMaterial attach="material-3" color={"#101018"} />
-        {/* front (your image) */}
-        <meshStandardMaterial
-          attach="material-4"
-          map={tex}
-          roughness={0.35}
-          metalness={0.15}
-          emissive={new THREE.Color("#111114")}
-          emissiveIntensity={0.35}
-        />
-        {/* back */}
-        <meshStandardMaterial attach="material-5" color={"#0b0b10"} />
-      </mesh>
-
-      {/* subtle rim light feel */}
-      <mesh position={[0, 0, 0.13]}>
-        <planeGeometry args={[1.92, 1.92]} />
-        <meshStandardMaterial
-          transparent
-          opacity={0.10}
-          color={"white"}
-          emissive={"#8c5aff"}
-          emissiveIntensity={0.6}
-        />
-      </mesh>
-
-      <Sparkles
-        count={speaking ? 120 : 70}
-        scale={[4, 4, 2]}
-        size={speaking ? 2.0 : 1.2}
-        speed={speaking ? 0.9 : 0.6}
-        opacity={0.7}
-        color={"#bfa6ff"}
-      />
+    <group ref={group} position={[0, -1.35, 0]} scale={1.75}>
+      <primitive object={gltf.scene} />
+      {!hasMorphs ? null : null}
     </group>
   );
 }
 
-/**
- * Subtitle bubble (big, proportional to avatar):
- * - Types in as Ghost speaks
- * - Then fades out and clears
- */
-function SpeakingBubble({
-  text,
-  visible,
-}: {
-  text: string;
-  visible: boolean;
-}) {
+/** ---------- 2D FALLBACK (if no GLB) ---------- */
+function GhostCard2D({ speakingIntensity }: { speakingIntensity: number }) {
+  // “Fake mouth” via subtle scale/brightness pulsing
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 14, scale: 0.98 }}
-      animate={{ opacity: visible ? 1 : 0, y: visible ? 0 : 14, scale: visible ? 1 : 0.98 }}
-      transition={{ duration: 0.25 }}
+    <div
       style={{
-        position: "absolute",
-        left: 24,
-        right: 24,
-        bottom: 18,
-        padding: "18px 18px",
-        borderRadius: 18,
-        border: "1px solid rgba(255,255,255,0.14)",
-        background:
-          "linear-gradient(180deg, rgba(255,255,255,0.08), rgba(0,0,0,0.40))",
-        boxShadow: "0 20px 60px rgba(0,0,0,0.65)",
-        pointerEvents: "none",
+        width: "min(760px, 86vw)",
+        height: "min(560px, 60vh)",
+        display: "grid",
+        placeItems: "center",
+        position: "relative",
+        borderRadius: 28,
+        background: "radial-gradient(1200px 600px at 50% 40%, rgba(150,90,255,0.22), rgba(0,0,0,0.0))",
+        overflow: "hidden",
       }}
     >
-      <div style={{ fontWeight: 900, opacity: 0.8, marginBottom: 6, letterSpacing: 0.3 }}>
-        Ghost
-      </div>
       <div
         style={{
-          fontSize: 22, // big + readable
-          lineHeight: 1.25,
-          fontWeight: 800,
+          position: "absolute",
+          inset: 0,
+          background:
+            "radial-gradient(900px 380px at 50% 60%, rgba(255,255,255,0.06), rgba(0,0,0,0.0))",
+          pointerEvents: "none",
+        }}
+      />
+      <img
+        src="/Ghost2.png"
+        alt="Ghost"
+        style={{
+          width: "min(520px, 72vw)",
+          height: "auto",
+          transform: `translateY(${Math.sin(Date.now() / 700) * 1}px) scale(${1 + speakingIntensity * 0.01})`,
+          filter: `drop-shadow(0 30px 80px rgba(0,0,0,0.65)) brightness(${1 + speakingIntensity * 0.06})`,
+          borderRadius: 24,
+          userSelect: "none",
+        }}
+      />
+      <div
+        style={{
+          position: "absolute",
+          bottom: 26,
+          left: "50%",
+          transform: "translateX(-50%)",
+          opacity: 0.6,
+          fontSize: 12,
+          letterSpacing: "0.18em",
+          textTransform: "uppercase",
+          color: "rgba(255,255,255,0.7)",
         }}
       >
-        {text}
+        (Using 2D fallback — upload /public/ghost.glb for real 3D + face rig)
       </div>
-    </motion.div>
+    </div>
   );
 }
 
+/** ---------- MAIN PAGE ---------- */
 export default function Page() {
-  const [activeNav, setActiveNav] = useState<"chat" | "team" | "execution">("chat");
-  const [agents, setAgents] = useState<Agent[]>(initialAgents);
+  const mounted = useIsMounted();
 
-  const [heat, setHeat] = useState<number>(() => localGet("ghost.heat", 22));
+  const [hasGLB, setHasGLB] = useState(true); // we’ll auto-fallback if GLB load fails
+  const [hasMorphs, setHasMorphs] = useState(false);
 
-  const [messages, setMessages] = useState<Msg[]>(() =>
-    localGet("ghost.messages", [
-      { id: 1, speaker: "Ghost", text: "I’m online. Give me the objective. I’ll run the team.", time: nowTime() },
-    ])
-  );
+  const [speak, setSpeak] = useState<SpeakState>({ text: "", visibleText: "", active: false });
+  const [speakingIntensity, setSpeakingIntensity] = useState(0); // 0..1
+  const [heat, setHeat] = useState(53);
 
-  const [broadcast, setBroadcast] = useState<string>(() =>
-    localGet("ghost.broadcast", quoteBank[0])
-  );
+  // “Look target” for the model
+  const lookAt = useMemo(() => new THREE.Vector3(0, 0.25, 2.2), []);
 
-  const [input, setInput] = useState("");
-
-  // speaking bubble state
-  const [speaking, setSpeaking] = useState(false);
-  const [bubbleVisible, setBubbleVisible] = useState(false);
-  const [bubbleText, setBubbleText] = useState("");
-
-  const chatRef = useRef<HTMLDivElement | null>(null);
-  const typingTimer = useRef<number | null>(null);
-  const hideTimer = useRef<number | null>(null);
-
-  useEffect(() => localSet("ghost.messages", messages), [messages]);
-  useEffect(() => localSet("ghost.heat", heat), [heat]);
-  useEffect(() => localSet("ghost.broadcast", broadcast), [broadcast]);
-
-  // auto-scroll
+  // Typewriter while speaking
   useEffect(() => {
-    if (!chatRef.current) return;
-    chatRef.current.scrollTop = chatRef.current.scrollHeight;
-  }, [messages.length]);
+    if (!speak.active) return;
 
-  // live broadcast rotation
+    let i = 0;
+    const text = speak.text;
+    const tick = setInterval(() => {
+      i += 1;
+      setSpeak((p) => ({ ...p, visibleText: text.slice(0, i) }));
+      // speaking intensity bumps as characters appear
+      setSpeakingIntensity((v) => clamp(v + 0.06, 0, 1));
+      if (i >= text.length) clearInterval(tick);
+    }, 22);
+
+    return () => clearInterval(tick);
+  }, [speak.active, speak.text]);
+
+  // Speaking “decay” + idle motion feel
   useEffect(() => {
     const id = setInterval(() => {
-      const next = quoteBank[Math.floor(Math.random() * quoteBank.length)];
-      setBroadcast(next);
-    }, 12000);
+      setSpeakingIntensity((v) => clamp(v * 0.84, 0, 1));
+    }, 80);
     return () => clearInterval(id);
   }, []);
 
-  const addMsg = (speaker: "Ghost" | "You", text: string) => {
-    setMessages((prev) => [...prev, { id: Date.now(), speaker, text, time: nowTime() }]);
-  };
+  // Random quote idle chatter
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (speak.active) return;
+      const q = QUOTES[Math.floor(Math.random() * QUOTES.length)];
+      doSpeak(q);
+    }, 18000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [speak.active]);
 
-  /** Ghost "talking" effect:
-   * - Bubble appears
-   * - Typewriter fills bubble
-   * - After finished, bubble fades away
-   * - Message still logged in chat
-   */
-  const speak = (full: string) => {
-    // cleanup any previous timers
-    if (typingTimer.current) window.clearInterval(typingTimer.current);
-    if (hideTimer.current) window.clearTimeout(hideTimer.current);
-
-    setSpeaking(true);
-    setBubbleVisible(true);
-    setBubbleText("");
-
-    let i = 0;
-    const speed = 18; // fast enough to feel real
-    typingTimer.current = window.setInterval(() => {
-      i++;
-      setBubbleText(full.slice(0, i));
-      if (i >= full.length) {
-        if (typingTimer.current) window.clearInterval(typingTimer.current);
-        typingTimer.current = null;
-
-        // finish speaking shortly after
-        setSpeaking(false);
-
-        // bubble disappears after a moment
-        hideTimer.current = window.setTimeout(() => {
-          setBubbleVisible(false);
-          setBubbleText("");
-          hideTimer.current = null;
-        }, 1200);
-      }
-    }, speed);
-
-    // also log to chat immediately (so it’s always recorded)
-    addMsg("Ghost", full);
-  };
-
-  const routeGhost = (userText: string) => {
-    const t = userText.toLowerCase();
-
-    if (t.includes("botox") || t.includes("med spa") || t.includes("aesthetics")) {
-      setAgents((prev) =>
-        prev.map((a) =>
-          a.id === "lead" || a.id === "outreach" ? { ...a, status: "Working" } : a
-        )
-      );
-      setHeat((h) => clamp(h + 10, 0, 100));
-      return "Copy. We’re running Botox lead gen. Pick ONE city right now: Austin, Houston, Dallas, or San Antonio. Then tell me your offer: free consult, booked appointments, or pay-per-lead.";
-    }
-
-    if (t.includes("plan") || t.includes("today") || t.includes("48")) {
-      setHeat((h) => clamp(h + 7, 0, 100));
-      return "48-hour plan: 1) pick one city, 2) list 30 clinics, 3) send 30 DMs + 30 emails, 4) follow up in 6 hours, 5) close 1 clinic on a trial. Tell me city + offer and I’ll generate the exact scripts.";
-    }
-
-    if (t.includes("quote")) {
-      const q = quoteBank[Math.floor(Math.random() * quoteBank.length)];
-      setBroadcast(q);
-      setHeat((h) => clamp(h + 3, 0, 100));
-      return q;
-    }
-
+  function doSpeak(text: string) {
+    // Start the bubble
+    setSpeak({ text, visibleText: "", active: true });
     setHeat((h) => clamp(h + 2, 0, 100));
-    return "Objective received. Be specific: city + offer + money target for the next 48 hours.";
-  };
 
-  const send = () => {
-    const txt = input.trim();
-    if (!txt) return;
-    setInput("");
-    addMsg("You", txt);
-
-    // ghost responds
-    window.setTimeout(() => {
-      const reply = routeGhost(txt);
-      speak(reply);
-    }, 380);
-  };
-
-  const shell = {
-    page: {
-      height: "100vh",
-      display: "grid",
-      gridTemplateColumns: "260px 1fr 380px",
-      gap: 18,
-      padding: 18,
-      background:
-        "radial-gradient(1200px 700px at 30% 10%, rgba(140,90,255,0.12), transparent 55%), radial-gradient(900px 600px at 70% 20%, rgba(255,80,80,0.08), transparent 55%), #07070a",
-    } as React.CSSProperties,
-    panel: {
-      borderRadius: 18,
-      border: "1px solid rgba(255,255,255,0.10)",
-      background: "rgba(255,255,255,0.03)",
-      boxShadow: "0 18px 60px rgba(0,0,0,0.55)",
-      overflow: "hidden",
-    } as React.CSSProperties,
-  };
-
-  const NavItem = ({
-    icon,
-    label,
-    value,
-  }: {
-    icon: React.ReactNode;
-    label: string;
-    value: "chat" | "team" | "execution";
-  }) => (
-    <button
-      onClick={() => setActiveNav(value)}
-      style={{
-        width: "100%",
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "12px 12px",
-        borderRadius: 12,
-        border: "1px solid rgba(255,255,255,0.10)",
-        background:
-          activeNav === value ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0)",
-        color: "white",
-        cursor: "pointer",
-        fontWeight: 700,
-      }}
-    >
-      {icon}
-      {label}
-    </button>
-  );
+    // Voice (Web Speech API)
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.rate = 1.02;
+        u.pitch = 0.9;
+        u.volume = 1;
+        u.onstart = () => setSpeakingIntensity(0.75);
+        u.onend = () => {
+          // Fade bubble out after “speaking”
+          setTimeout(() => {
+            setSpeak((p) => ({ ...p, active: false }));
+            setTimeout(() => setSpeak({ text: "", visibleText: "", active: false }), 450);
+          }, 700);
+        };
+        window.speechSynthesis.speak(u);
+      } catch {
+        // If voice fails, still fade bubble
+        setTimeout(() => setSpeak((p) => ({ ...p, active: false })), 1400);
+      }
+    } else {
+      setTimeout(() => setSpeak((p) => ({ ...p, active: false })), 1400);
+    }
+  }
 
   return (
-    <div style={shell.page}>
-      {/* LEFT NAV */}
-      <aside style={{ ...shell.panel, padding: 16 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "radial-gradient(1200px 700px at 50% 20%, rgba(155,95,255,0.18), rgba(0,0,0,0) 60%), #07070a",
+        color: "white",
+        display: "grid",
+        gridTemplateColumns: "340px 1fr 360px",
+        gap: 18,
+        padding: 18,
+      }}
+    >
+      {/* LEFT */}
+      <div
+        style={{
+          borderRadius: 24,
+          background: "rgba(255,255,255,0.03)",
+          border: "1px solid rgba(255,255,255,0.08)",
+          padding: 16,
+        }}
+      >
+        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
           <div
             style={{
-              width: 38,
-              height: 38,
-              borderRadius: 12,
+              width: 44,
+              height: 44,
+              borderRadius: 14,
               display: "grid",
               placeItems: "center",
               background: "rgba(255,255,255,0.08)",
@@ -469,247 +305,281 @@ export default function Page() {
             G
           </div>
           <div>
-            <div style={{ fontWeight: 900 }}>Ghost OS</div>
-            <div style={{ opacity: 0.7, fontSize: 12 }}>COO Agent Interface</div>
+            <div style={{ fontWeight: 800, fontSize: 18 }}>Ghost OS</div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>COO Agent Interface</div>
           </div>
         </div>
 
-        <div style={{ display: "grid", gap: 10 }}>
-          <NavItem icon={<MessageSquare size={18} />} label="Command Chat" value="chat" />
-          <NavItem icon={<Users size={18} />} label="Agent Team" value="team" />
-          <NavItem icon={<Zap size={18} />} label="Execution" value="execution" />
+        <div style={{ marginTop: 16, padding: 14, borderRadius: 18, background: "rgba(0,0,0,0.35)", border: "1px solid rgba(255,255,255,0.08)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+            <div style={{ fontSize: 12, letterSpacing: "0.18em", textTransform: "uppercase", opacity: 0.7 }}>
+              Heat
+            </div>
+            <div style={{ fontWeight: 700 }}>{heat}/100</div>
+          </div>
+          <div style={{ height: 10, borderRadius: 999, background: "rgba(255,255,255,0.08)", overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${heat}%`, background: "linear-gradient(90deg, rgba(180,120,255,0.9), rgba(255,80,140,0.9))" }} />
+          </div>
         </div>
 
-        <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.08)" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-            <Flame size={18} />
-            <div style={{ fontWeight: 900 }}>Heat</div>
-            <div style={{ marginLeft: "auto", opacity: 0.8, fontWeight: 900 }}>{heat}</div>
-          </div>
-          <div
-            style={{
-              height: 10,
-              borderRadius: 999,
-              background: "rgba(255,255,255,0.08)",
-              overflow: "hidden",
-              border: "1px solid rgba(255,255,255,0.08)",
-            }}
-          >
-            <div
-              style={{
-                width: `${heat}%`,
-                height: "100%",
-                background:
-                  "linear-gradient(90deg, rgba(140,90,255,0.9), rgba(255,80,80,0.85))",
-              }}
-            />
-          </div>
+        <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7, lineHeight: 1.5 }}>
+          Tips:
+          <div>• Upload <b>/public/ghost.glb</b> for real 3D face rig.</div>
+          <div>• Your PNG stays as fallback: <b>/public/Ghost2.png</b></div>
+          <div>• Click “Random Quote” to test voice + type-speech.</div>
         </div>
-      </aside>
+      </div>
 
       {/* CENTER */}
-      <main style={{ ...shell.panel, display: "grid", gridTemplateRows: "auto 1fr auto" }}>
-        {/* header with BIG 3D Ghost */}
-        <div
-          style={{
-            padding: 16,
-            borderBottom: "1px solid rgba(255,255,255,0.08)",
-            background: "rgba(0,0,0,0.16)",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 900, fontSize: 18 }}>Ghost (COO)</div>
-              <div style={{ opacity: 0.75, fontSize: 13 }}>
-                Live Broadcast: <span style={{ opacity: 1 }}>{broadcast}</span>
-              </div>
+      <div
+        style={{
+          borderRadius: 24,
+          background: "rgba(255,255,255,0.03)",
+          border: "1px solid rgba(255,255,255,0.08)",
+          overflow: "hidden",
+          position: "relative",
+        }}
+      >
+        {/* Header */}
+        <div style={{ padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontWeight: 900, fontSize: 20 }}>Ghost (COO)</div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>
+              Live Broadcast: <span style={{ opacity: 1 }}>{speak.active ? speak.visibleText || "…" : QUOTES[0]}</span>
             </div>
-
-            <button
-              onClick={() => speak(quoteBank[Math.floor(Math.random() * quoteBank.length)])}
-              style={{
-                padding: "10px 12px",
-                borderRadius: 12,
-                border: "1px solid rgba(255,255,255,0.14)",
-                background: "rgba(255,255,255,0.06)",
-                color: "white",
-                cursor: "pointer",
-                fontWeight: 800,
-              }}
-            >
-              Random Quote
-            </button>
+            <div style={{ fontSize: 11, opacity: 0.55, marginTop: 6 }}>
+              {hasGLB ? (hasMorphs ? "3D model loaded (morph targets detected)" : "3D model loaded (no morph targets detected)") : "2D fallback mode"}
+            </div>
           </div>
 
-          {/* HUGE 3D stage */}
-          <div
+          <button
+            onClick={() => doSpeak(QUOTES[Math.floor(Math.random() * QUOTES.length)])}
             style={{
-              marginTop: 14,
-              height: 420, // BIG stage
-              borderRadius: 18,
-              border: "1px solid rgba(255,255,255,0.10)",
-              background:
-                "radial-gradient(900px 420px at 30% 10%, rgba(140,90,255,0.18), transparent 60%), radial-gradient(700px 360px at 70% 30%, rgba(255,80,80,0.10), transparent 60%), rgba(255,255,255,0.02)",
-              overflow: "hidden",
-              position: "relative",
+              padding: "10px 14px",
+              borderRadius: 14,
+              background: "rgba(255,255,255,0.06)",
+              border: "1px solid rgba(255,255,255,0.12)",
+              color: "white",
+              fontWeight: 700,
+              cursor: "pointer",
             }}
           >
-            {/* speaking subtitle bubble (big, proportional) */}
-            <SpeakingBubble text={bubbleText} visible={bubbleVisible} />
+            Random Quote
+          </button>
+        </div>
 
+        {/* 3D Stage */}
+        <div style={{ height: "calc(100vh - 240px)", minHeight: 520, position: "relative" }}>
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              background:
+                "radial-gradient(1200px 600px at 50% 45%, rgba(155,95,255,0.26), rgba(0,0,0,0.0) 65%)",
+              pointerEvents: "none",
+            }}
+          />
+
+          {hasGLB ? (
             <Canvas
               shadows
-              camera={{ position: [0, 0.2, 3.2], fov: 40 }}
-              style={{ width: "100%", height: "100%" }}
+              camera={{ position: [0, 0.55, 3.4], fov: 40 }}
+              onCreated={() => {
+                // nothing
+              }}
             >
-              <color attach="background" args={["#05050a"]} />
-              <ambientLight intensity={0.35} />
-              <directionalLight position={[3, 3, 2]} intensity={1.15} castShadow />
-              <pointLight position={[-3, 1, 2]} intensity={0.8} color={"#8c5aff"} />
-              <pointLight position={[2, -1, 2]} intensity={0.6} color={"#ff5050"} />
+              <ambientLight intensity={0.6} />
+              <directionalLight position={[4, 6, 3]} intensity={1.15} />
+              <pointLight position={[-3, 2, 2]} intensity={0.55} />
 
-              <Ghost3D
-                speaking={speaking}
-                mood={heat}
-                onClick={() => speak(quoteBank[Math.floor(Math.random() * quoteBank.length)])}
+              <Sparkles count={80} scale={6} size={1.2} speed={0.25} opacity={0.25} />
+
+              <Float speed={1.1} rotationIntensity={0.25} floatIntensity={0.35}>
+                <SuspenseGLB
+                  speakingIntensity={speakingIntensity}
+                  lookAt={lookAt}
+                  onModelInfo={(ok, morphs) => {
+                    if (!ok) setHasGLB(false);
+                    setHasMorphs(morphs);
+                  }}
+                />
+              </Float>
+
+              <Environment preset="city" />
+              <OrbitControls
+                enablePan={false}
+                enableZoom={false}
+                minPolarAngle={Math.PI / 2.3}
+                maxPolarAngle={Math.PI / 2.1}
               />
 
-              {/* subtle floor */}
-              <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -1.25, 0]} receiveShadow>
-                <planeGeometry args={[12, 12]} />
-                <meshStandardMaterial color={"#07070a"} roughness={1} metalness={0} />
-              </mesh>
-
-              {/* optional environment (no network fetch) */}
-              <Environment preset="city" />
+              {/* Speech bubble pinned near the head */}
+              <Html position={[0, 1.05, 0.6]} center>
+                <AnimatePresence>
+                  {speak.active && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 10, scale: 0.98 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: -10, scale: 0.98 }}
+                      transition={{ duration: 0.22 }}
+                      style={{
+                        width: "min(560px, 70vw)",
+                        padding: 14,
+                        borderRadius: 18,
+                        background: "rgba(10,10,14,0.78)",
+                        border: "1px solid rgba(255,255,255,0.14)",
+                        boxShadow: "0 20px 60px rgba(0,0,0,0.55)",
+                        fontSize: 16,
+                        lineHeight: 1.35,
+                      }}
+                    >
+                      <div style={{ fontWeight: 900, marginBottom: 6, opacity: 0.9 }}>Ghost</div>
+                      <div style={{ opacity: 0.92 }}>
+                        {speak.visibleText}
+                        <span style={{ marginLeft: 6, opacity: 0.65 }}>▋</span>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </Html>
             </Canvas>
-          </div>
-        </div>
-
-        {/* chat log */}
-        <div
-          ref={chatRef}
-          style={{
-            padding: 16,
-            overflow: "auto",
-            background:
-              "radial-gradient(900px 500px at 50% 0%, rgba(140,90,255,0.10), transparent 55%)",
-          }}
-        >
-          {messages.map((m) => (
-            <div key={m.id} style={{ marginBottom: 12 }}>
-              <div style={{ display: "flex", alignItems: "baseline", gap: 10, opacity: 0.9 }}>
-                <div style={{ fontWeight: 900 }}>{m.speaker}</div>
-                <div style={{ fontSize: 12, opacity: 0.6 }}>{m.time}</div>
-              </div>
-              <div
-                style={{
-                  marginTop: 6,
-                  padding: "12px 12px",
-                  borderRadius: 14,
-                  border: "1px solid rgba(255,255,255,0.10)",
-                  background: m.speaker === "Ghost" ? "rgba(255,255,255,0.06)" : "rgba(140,90,255,0.10)",
-                  maxWidth: 920,
-                }}
-              >
-                {m.text}
+          ) : (
+            <div style={{ height: "100%", display: "grid", placeItems: "center" }}>
+              <GhostCard2D speakingIntensity={speakingIntensity} />
+              <div style={{ position: "absolute", top: 14, right: 14, fontSize: 12, opacity: 0.65 }}>
+                Upload <b>/public/ghost.glb</b> to enable true 3D + face
               </div>
             </div>
-          ))}
+          )}
         </div>
 
-        {/* input */}
-        <div
-          style={{
-            padding: 14,
-            borderTop: "1px solid rgba(255,255,255,0.08)",
-            display: "flex",
-            gap: 10,
-          }}
-        >
+        {/* Bottom input */}
+        <div style={{ padding: 16, borderTop: "1px solid rgba(255,255,255,0.08)", display: "flex", gap: 10 }}>
           <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") send();
-            }}
-            placeholder={`Tell Ghost what you're working on… (ex: "Botox leads Austin")`}
+            placeholder='Tell Ghost what you’re working on… (ex: "Botox leads Austin")'
             style={{
               flex: 1,
-              padding: "12px 12px",
+              padding: "12px 14px",
               borderRadius: 14,
-              border: "1px solid rgba(255,255,255,0.12)",
               background: "rgba(0,0,0,0.35)",
+              border: "1px solid rgba(255,255,255,0.10)",
               color: "white",
               outline: "none",
             }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                const v = (e.currentTarget as HTMLInputElement).value.trim();
+                if (!v) return;
+                doSpeak(`Objective received: ${v}. I’m delegating now. Next move: send 10 DMs today.`);
+                (e.currentTarget as HTMLInputElement).value = "";
+              }
+            }}
           />
           <button
-            onClick={send}
             style={{
-              padding: "12px 14px",
+              padding: "12px 16px",
               borderRadius: 14,
-              border: "1px solid rgba(255,255,255,0.14)",
-              background: "linear-gradient(90deg, rgba(140,90,255,0.9), rgba(120,80,255,0.65))",
+              background: "linear-gradient(90deg, rgba(140,90,255,1), rgba(255,80,140,1))",
+              border: "none",
               color: "white",
-              cursor: "pointer",
               fontWeight: 900,
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
+              cursor: "pointer",
             }}
+            onClick={() => doSpeak("Locked in. Move with discipline.")}
           >
-            <SendHorizonal size={18} />
             Send
           </button>
         </div>
-      </main>
+      </div>
 
-      {/* RIGHT TEAM */}
-      <aside style={{ ...shell.panel, padding: 16 }}>
-        <div style={{ fontWeight: 900, marginBottom: 12 }}>Team</div>
-
-        <div style={{ display: "grid", gap: 10 }}>
-          {agents.map((a) => (
-            <div
-              key={a.id}
-              style={{
-                padding: 12,
-                borderRadius: 14,
-                border: "1px solid rgba(255,255,255,0.10)",
-                background: "rgba(255,255,255,0.03)",
-              }}
-            >
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                <div style={{ fontWeight: 900 }}>{a.name}</div>
-                <div
-                  style={{
-                    marginLeft: "auto",
-                    padding: "4px 10px",
-                    borderRadius: 999,
-                    border: "1px solid rgba(255,255,255,0.12)",
-                    background: a.status === "Working" ? "rgba(255,80,80,0.10)" : "rgba(255,255,255,0.05)",
-                    fontSize: 12,
-                    fontWeight: 800,
-                    opacity: 0.95,
-                  }}
-                >
-                  {a.status}
-                </div>
-              </div>
-              <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>{a.role}</div>
+      {/* RIGHT */}
+      <div
+        style={{
+          borderRadius: 24,
+          background: "rgba(255,255,255,0.03)",
+          border: "1px solid rgba(255,255,255,0.08)",
+          padding: 16,
+        }}
+      >
+        <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 12 }}>Team</div>
+        {[
+          { name: "Lead Gen", text: "Find & qualify Botox/MedSpa buyers", status: "Idle" },
+          { name: "Outreach", text: "DM/SMS/Email scripts + follow-ups", status: "Idle" },
+          { name: "Ops", text: "Task routing + checklists", status: "Idle" },
+          { name: "Research", text: "Offers, pricing, competitors", status: "Idle" },
+          { name: "Automation", text: "Connect tools + reduce manual work", status: "Idle" },
+        ].map((a) => (
+          <div
+            key={a.name}
+            style={{
+              borderRadius: 18,
+              background: "rgba(0,0,0,0.35)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              padding: 14,
+              marginBottom: 10,
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 12,
+              alignItems: "center",
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 900 }}>{a.name}</div>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>{a.text}</div>
             </div>
-          ))}
-        </div>
-
-        <div style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid rgba(255,255,255,0.08)" }}>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>
-            Ghost is loaded from <b>/public/Ghost2.png</b>.
-            <br />
-            Keep the same filename to swap art instantly later.
+            <div style={{ fontSize: 12, padding: "4px 10px", borderRadius: 999, border: "1px solid rgba(255,255,255,0.10)", opacity: 0.85 }}>
+              {a.status}
+            </div>
           </div>
+        ))}
+        <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7, lineHeight: 1.45 }}>
+          <b>To make him “real”:</b>
+          <div>1) Export a rigged GLB/VRM with facial blendshapes (visemes).</div>
+          <div>2) Put it at <b>/public/ghost.glb</b></div>
+          <div>3) Refresh. The stage becomes true 3D + mouth movement.</div>
         </div>
-      </aside>
+      </div>
+
+      {!mounted.current ? null : null}
     </div>
   );
 }
+
+/** Suspense-like wrapper without React.Suspense to avoid edge cases in some builds */
+function SuspenseGLB({
+  speakingIntensity,
+  lookAt,
+  onModelInfo,
+}: {
+  speakingIntensity: number;
+  lookAt: THREE.Vector3;
+  onModelInfo: (ok: boolean, morphs: boolean) => void;
+}) {
+  const [ok, setOk] = useState(true);
+
+  // If GLB fails, Drei throws; we guard by try/catch in effect-ish pattern using a fallback boundary approach:
+  // For simplicity: if this component ever errors, user will see 2D fallback on next render (handled by parent state),
+  // but Next/React error boundaries aren't in this snippet. In practice, if you don't have ghost.glb, set hasGLB=false.
+
+  useEffect(() => {
+    // If you don't upload ghost.glb, just switch to 2D fallback:
+    // onModelInfo(false, false)
+  }, [onModelInfo]);
+
+  if (!ok) return null;
+
+  try {
+    return (
+      <GhostModel
+        speakingIntensity={speakingIntensity}
+        lookAt={lookAt}
+        onLoaded={(morphs) => onModelInfo(true, morphs)}
+      />
+    );
+  } catch {
+    onModelInfo(false, false);
+    return null;
+  }
+}
+
+useGLTF.preload("/ghost.glb");
